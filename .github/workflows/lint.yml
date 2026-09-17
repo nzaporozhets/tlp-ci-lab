@@ -1,0 +1,380 @@
+# =============================================================================
+# Lint and validate
+# =============================================================================
+# The third workflow, and the only one that runs automatically.
+#
+# It checks that the OTHER two workflows are well-formed and that this project's
+# two security rules still hold. It changes nothing, anywhere.
+#
+# WHY THIS ONE RUNS ON GITHUB'S RUNNERS AND deploy.yml DOES NOT
+#
+# deploy.yml has to run on your self-hosted runner, because that is the only
+# machine with credentials to your Kubernetes cluster. This workflow needs no
+# cluster at all -- it only reads files -- so it runs on a throwaway virtual
+# machine that GitHub creates and destroys for each run.
+#
+# That difference is not a convenience, it is the security boundary. Because this
+# workflow is triggered by `pull_request`, it runs code from the pull request's
+# branch, and anyone can open a pull request. Running that on GitHub's disposable
+# machine is fine. Running it on YOUR runner, which can reach your cluster, would
+# hand a stranger your cluster. The guard in the last step exists to make sure
+# nobody ever accidentally moves this line.
+#
+# See docs/github-actions-101.md sections 4 and 9.
+# =============================================================================
+
+name: Lint and validate
+
+# -----------------------------------------------------------------------------
+# Three triggers, and this is the workflow where you can see what each one does:
+#   pull_request      -- runs on every push to a branch that has an open PR, and
+#                        shows up as a check on the PR page. This is "CI as a
+#                        gate": you see a red X before merging, not after.
+#   push (main only)  -- runs again once merged, so main is always known-good.
+#   workflow_dispatch -- lets you run it by hand from the Actions tab.
+# -----------------------------------------------------------------------------
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - mvp-cluster-only
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pinned tool versions. Pinning means "the check that passed yesterday passes
+# today for the same reasons". Bumping these is a normal, deliberate change: pick
+# a version, then fetch its published checksum and update it here too.
+env:
+  ACTIONLINT_VERSION: 1.7.7
+  ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+  HELM_VERSION: 3.16.3
+  HELM_SHA256: f5355c79190951eed23c5432a3b920e071f4c00a64f75e077de0dd4cb7b294ea
+  # The chart version to validate the values templates against. Keep this equal
+  # to the TELEPORT_VERSION repository variable, or lint will be checking a
+  # different chart from the one you deploy.
+  CHART_VERSION: 18.11.1
+  CHART_REPO_URL: https://charts.releases.teleport.dev
+
+jobs:
+  lint:
+    # GitHub's own runner. NEVER change this to `self-hosted` -- see the header
+    # comment, and the guard in the final step which will fail if you do.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out this repository onto the runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # =======================================================================
+      # Install the two tools that are not already on GitHub's image.
+      # =======================================================================
+      # Both are downloaded to a pinned version and checked against a published
+      # SHA-256 before being used. `sha256sum --check` exits non-zero on a
+      # mismatch, and because the shell runs with `-e` that stops the job -- so a
+      # tampered or truncated download cannot quietly become the linter.
+      - name: Install actionlint and helm
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/bin"
+
+          curl --fail --silent --show-error --location \
+            -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum --check
+          tar -xzf actionlint.tar.gz -C "${HOME}/bin" actionlint
+
+          curl --fail --silent --show-error --location \
+            -o helm.tar.gz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum --check
+          tar -xzf helm.tar.gz -C "${HOME}/bin" --strip-components=1 linux-amd64/helm
+
+          # Appending a directory to $GITHUB_PATH puts it on PATH for every LATER
+          # step in this job -- the same trick as $GITHUB_ENV, but for PATH.
+          echo "${HOME}/bin" >> "$GITHUB_PATH"
+
+          # yamllint is not on the image and is a single Python package.
+          sudo apt-get update
+          sudo apt-get install --yes yamllint
+
+      - name: Show the tool versions being used
+        run: |
+          set -euo pipefail
+          actionlint --version
+          helm version --short
+          yamllint --version
+          shellcheck --version | head -2
+
+      # =======================================================================
+      # CHECK 1 -- actionlint over the workflows.
+      # =======================================================================
+      # actionlint understands the Actions schema, so it catches misspelled keys,
+      # invalid `${{ }}` expressions, references to contexts that do not exist in
+      # a given position, and bad `runs-on` values.
+      #
+      # It ALSO runs shellcheck over every inline `run:` block. That is what makes
+      # this project's "put the logic inline, not in scripts/" decision safe:
+      # the shell in deploy.yml gets exactly the same scrutiny a separate .sh
+      # file would.
+      - name: Check the workflows with actionlint
+        run: |
+          set -euo pipefail
+          actionlint -color .github/workflows/*.yml
+          echo "actionlint found no problems."
+
+      # =======================================================================
+      # CHECK 2 -- yamllint over every YAML file we own.
+      # =======================================================================
+      # Whitespace, indentation and duplicate keys. A duplicate key in YAML is
+      # legal-ish and silently wins, which is the sort of bug that takes an hour
+      # to find. Configuration and the reasoning behind each relaxed rule is in
+      # .yamllint.yml.
+      - name: Check YAML formatting with yamllint
+        run: |
+          set -euo pipefail
+          yamllint --strict --config-file .yamllint.yml .github/workflows/ helm/
+          echo "yamllint found no problems."
+
+      # =======================================================================
+      # CHECK 3 -- shellcheck the one standalone script.
+      # =======================================================================
+      # Everything else in this project is inline in a workflow and covered by
+      # actionlint above. runner/install-runner.sh is the deliberate exception,
+      # because it runs on a bare VM before any of this exists.
+      - name: Check the runner install script with shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck runner/install-runner.sh
+          echo "shellcheck found no problems."
+
+      # =======================================================================
+      # CHECK 4 -- do the Helm values templates actually produce a valid chart?
+      # =======================================================================
+      # helm/values.yaml and helm/values.nodeport.yaml contain ${PLACEHOLDERS}
+      # that deploy.yml fills in from repository variables. Here we fill them with
+      # obvious dummy values and render the chart for real. This catches a typo in
+      # a values key, or a values combination the chart rejects, on the pull
+      # request -- long before anyone presses Deploy.
+      #
+      # No cluster and no credentials are needed: `helm template` renders locally.
+      - name: Validate both Helm values templates against the real chart
+        run: |
+          set -euo pipefail
+
+          helm repo add teleport "${CHART_REPO_URL}" --force-update
+          helm repo update teleport
+          rm -rf chart && mkdir -p chart
+          helm pull teleport/teleport-cluster --version "${CHART_VERSION}" \
+            --untar --untardir chart
+
+          # Placeholder values. They only have to be *shaped* correctly -- a
+          # plausible DNS name, a size Kubernetes understands -- because nothing
+          # here contacts a cluster.
+          export TELEPORT_CLUSTER_NAME="teleport.example.com"
+          export TLS_SECRET_NAME="teleport-tls"
+          export LICENSE_SECRET_NAME="teleport-license"
+          export STORAGE_CLASS=""
+          export VOLUME_SIZE="10Gi"
+
+          for template in helm/values.yaml helm/values.nodeport.yaml; do
+            echo ""
+            echo "=================================================="
+            echo "  ${template}"
+            echo "=================================================="
+
+            # values.yaml is templated for whichever service type you configured;
+            # values.nodeport.yaml hardcodes NodePort and needs PUBLIC_ADDR.
+            if [[ "${template}" == "helm/values.nodeport.yaml" ]]; then
+              export SERVICE_TYPE="NodePort"
+              export PUBLIC_ADDR="teleport.example.com:32443"
+            else
+              export SERVICE_TYPE="LoadBalancer"
+              export PUBLIC_ADDR=""
+            fi
+
+            # Single quotes keep the ${...} names literal, which is what envsubst
+            # wants -- hence the shellcheck exemption.
+            # shellcheck disable=SC2016
+            envsubst \
+              '${TELEPORT_CLUSTER_NAME} ${TLS_SECRET_NAME} ${LICENSE_SECRET_NAME} ${SERVICE_TYPE} ${PUBLIC_ADDR} ${STORAGE_CLASS} ${VOLUME_SIZE}' \
+              < "${template}" > rendered.yaml
+
+            helm lint chart/teleport-cluster --values rendered.yaml --namespace teleport
+            helm template teleport chart/teleport-cluster \
+              --values rendered.yaml --namespace teleport > manifests.yaml
+
+            # The same three assertions deploy.yml makes, for the same reasons.
+            grep -q 'teleport-ent-distroless' manifests.yaml \
+              || { echo "::error title=Not the Enterprise image::${template} did not render teleport-ent-distroless"; exit 1; }
+            grep -q 'https_keypairs:' manifests.yaml \
+              || { echo "::error title=Certificate not wired in::${template} did not render https_keypairs"; exit 1; }
+            grep -q 'license_file: /var/lib/license/license.pem' manifests.yaml \
+              || { echo "::error title=Licence not wired in::${template} did not render license_file"; exit 1; }
+            if grep -qE '^  replicas: [2-9]' manifests.yaml; then
+              echo "::error title=More than one replica::${template} renders more than one replica; chartMode standalone uses SQLite on a ReadWriteOnce volume and cannot be scaled"
+              exit 1
+            fi
+
+            # NodePort only: prove PUBLIC_ADDR reached the proxy's public_addr.
+            # Without this the chart advertises port 443 while the Service listens
+            # on a 30000-32767 node port -- the trap described at the top of
+            # helm/values.nodeport.yaml.
+            if [[ "${template}" == "helm/values.nodeport.yaml" ]]; then
+              grep -q -- "- ${PUBLIC_ADDR}" manifests.yaml \
+                || { echo "::error title=PUBLIC_ADDR not applied::${template} did not render public_addr as ${PUBLIC_ADDR}"; exit 1; }
+              echo "OK: public_addr is ${PUBLIC_ADDR}"
+            fi
+
+            echo "OK: ${template} renders a valid Enterprise chart with the expected TLS and licence wiring."
+          done
+
+      # =======================================================================
+      # GUARD 1 -- no GitHub secrets, anywhere.
+      # =======================================================================
+      # This project's headline property is that it uses ZERO GitHub secrets: the
+      # licence and the TLS key live only in Kubernetes, and cluster credentials
+      # live only on the runner. That is a property of the code, so it is checked
+      # by code -- a promise in a README drifts, a failing test does not.
+      #
+      # The one allowed exception is `secrets.GITHUB_TOKEN`, which GitHub creates
+      # automatically for every run and which you cannot avoid having.
+      #
+      # If you ever genuinely need a secret, that is a deliberate decision: change
+      # this guard in the same pull request, and explain why in the description.
+      - name: Guard -- no workflow may reference a GitHub secret
+        run: |
+          set -euo pipefail
+          violations=0
+
+          for file in .github/workflows/*.yml; do
+            # Strip comments first, so the prose in these files (which talks
+            # about secrets constantly) cannot trigger the guard. Only real YAML
+            # is examined.
+            body="$(sed 's/#.*$//' "${file}")"
+
+            # Three ways to reach a secret: `secrets.NAME`, `secrets['NAME']`,
+            # and `toJSON(secrets)` to dump the lot. All are matched; the
+            # automatic GITHUB_TOKEN is then excluded.
+            found="$(grep -nE "secrets\.[A-Za-z0-9_]+|secrets *\[|toJSON\( *secrets *\)" <<<"${body}" \
+              | grep -v 'secrets\.GITHUB_TOKEN' || true)"
+
+            if [[ -n "${found}" ]]; then
+              echo "${file} references a GitHub secret:"
+              # Line numbers are from the comment-stripped copy, which has the
+              # same line count as the original, so they still point at the right
+              # line in the file.
+              awk '{ print "    " $0 }' <<<"${found}"
+              violations=$((violations + 1))
+            fi
+          done
+
+          if [[ "${violations}" -gt 0 ]]; then
+            echo ""
+            echo "This project uses ZERO GitHub secrets, by design (SPEC-MVP.md section 5.2):"
+            echo "  * the Teleport licence and the TLS private key live in Kubernetes secrets"
+            echo "    that the operator creates by hand, and never enter the pipeline;"
+            echo "  * cluster credentials are ambient on the self-hosted runner."
+            echo "Only 'secrets.GITHUB_TOKEN' is allowed, because GitHub provides it automatically."
+            echo "::error title=A workflow references a GitHub secret::${violations} file(s) violate the zero-secrets rule -- see SPEC-MVP.md section 5.2"
+            exit 1
+          fi
+          echo "OK: no workflow references a GitHub secret."
+
+      # =======================================================================
+      # GUARD 2 -- a pull request must never run on the self-hosted runner.
+      # =======================================================================
+      # THE MOST IMPORTANT CHECK IN THIS REPOSITORY.
+      #
+      # Anyone with a GitHub account can open a pull request against a public
+      # repository, and a `pull_request`-triggered workflow runs the code from
+      # that pull request's branch -- including any change it made to the workflow
+      # file itself. If such a workflow ran on the self-hosted runner, a stranger
+      # could add a step that reads the runner's Kubernetes credentials and
+      # takes over your cluster.
+      #
+      # So: `pull_request` (or `pull_request_target`) and `self-hosted` must never
+      # appear in the same workflow file. deploy.yml and uninstall.yml satisfy
+      # this by being `workflow_dispatch` only; this guard exists to stop a future
+      # edit from quietly breaking it.
+      - name: Guard -- no pull_request-triggered workflow may use a self-hosted runner
+        run: |
+          set -euo pipefail
+          violations=0
+
+          for file in .github/workflows/*.yml; do
+            # Comments stripped, for the same reason as the guard above: these
+            # files discuss both `pull_request` and `self-hosted` at length.
+            body="$(sed 's/#.*$//' "${file}")"
+
+            # Is it triggered by a pull request? Both YAML spellings are checked:
+            # the block form (`pull_request:` indented under `on:`) and the inline
+            # list form (`on: [pull_request, push]`).
+            triggered_by_pr=no
+            if grep -qE '^[[:space:]]{1,4}pull_request(_target)?:' <<<"${body}" \
+               || grep -qE '^on:.*pull_request' <<<"${body}"; then
+              triggered_by_pr=yes
+            fi
+
+            # Does it ask for the self-hosted runner? Again both spellings:
+            # `runs-on: [self-hosted, ...]` and a multi-line `- self-hosted` list.
+            #
+            # Note the `^[[:space:]]*` anchor. Without it, this very file matches
+            # its own search pattern -- the text `runs-on:` and the text
+            # `self-hosted` both appear on the line below -- and the guard
+            # reports itself as a violation. Anchoring to the start of a line
+            # means only a real YAML key can match. A guard that flags itself is
+            # a guard people switch off, so this detail matters.
+            uses_self_hosted=no
+            if grep -qE '^[[:space:]]*runs-on:.*self-hosted' <<<"${body}" \
+               || grep -qE '^[[:space:]]*-[[:space:]]*"?self-hosted"?[[:space:]]*$' <<<"${body}"; then
+              uses_self_hosted=yes
+            fi
+
+            printf '%-40s pull_request=%-3s self-hosted=%s\n' \
+              "${file}" "${triggered_by_pr}" "${uses_self_hosted}"
+
+            if [[ "${triggered_by_pr}" == "yes" && "${uses_self_hosted}" == "yes" ]]; then
+              echo "  ^^ VIOLATION"
+              violations=$((violations + 1))
+            fi
+          done
+
+          if [[ "${violations}" -gt 0 ]]; then
+            echo ""
+            echo "A workflow is triggered by a pull request AND runs on the self-hosted runner."
+            echo "That runner holds live Kubernetes credentials, and a pull request can come from"
+            echo "anyone and can modify the workflow file itself. Never combine the two."
+            echo ""
+            echo "Fix it by doing one of:"
+            echo "  * remove the pull_request trigger (use workflow_dispatch, like deploy.yml);"
+            echo "  * or move the job to 'runs-on: ubuntu-latest', if it does not need the cluster."
+            echo "::error title=A pull request can run on the self-hosted runner::${violations} file(s) violate SPEC-MVP.md section 7.3 -- this would expose your Kubernetes cluster"
+            exit 1
+          fi
+          echo "OK: no pull_request-triggered workflow uses the self-hosted runner."
+
+      - name: Write the lint summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## Lint and validate"
+            echo ""
+            echo "| Check | What it protects against |"
+            echo "|---|---|"
+            echo "| actionlint | invalid workflow syntax, and bugs in the inline shell |"
+            echo "| yamllint | indentation mistakes and duplicate keys |"
+            echo "| shellcheck | bugs in \`runner/install-runner.sh\` |"
+            echo "| helm lint / template | values templates that do not produce a valid chart |"
+            echo "| zero-secrets guard | a GitHub secret creeping into the pipeline |"
+            echo "| self-hosted guard | a pull request gaining access to your cluster |"
+          } >> "$GITHUB_STEP_SUMMARY"

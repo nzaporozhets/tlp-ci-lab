@@ -1,0 +1,1180 @@
+# =============================================================================
+# Deploy Teleport cluster
+# =============================================================================
+# WHAT THIS FILE IS
+#
+# This is a GitHub Actions *workflow*. GitHub looks in `.github/workflows/` for
+# YAML files like this one and runs them when the event described under `on:`
+# happens. Nothing outside this directory is magic -- the filename does not
+# matter, only the contents.
+#
+# This workflow installs (or upgrades) a Teleport Enterprise cluster into an
+# existing Kubernetes cluster using the official `teleport-cluster` Helm chart.
+#
+# If you have never used GitHub Actions, read docs/github-actions-101.md first.
+# It explains every concept below using this exact file as the example.
+#
+# THE ONE THING TO UNDERSTAND ABOUT THIS WORKFLOW
+#
+# It handles no credentials. There are zero GitHub secrets in this repository.
+# The workflow simply assumes that on the machine it runs on (your self-hosted
+# runner), `kubectl` is already logged in to the right Kubernetes cluster. How
+# that login happens -- Teleport Machine & Workload Identity, a kubeconfig
+# file, an in-cluster ServiceAccount -- is deliberately none of this
+# workflow's business. See docs/setup.md step 5.
+#
+# Everything the workflow needs to know comes from *repository variables*
+# (Settings -> Secrets and variables -> Actions -> Variables tab). Variables are
+# not secret: they are printed in the log on purpose, in the very first steps,
+# so you can see what the run is using.
+# =============================================================================
+
+name: Deploy Teleport cluster
+
+# -----------------------------------------------------------------------------
+# `on:` -- what makes this workflow run.
+#
+# `workflow_dispatch` means "only when a human presses the button": go to the
+# Actions tab, pick this workflow in the left sidebar, and click "Run workflow".
+# There is deliberately no `push:` trigger. A `git push` should not be able to
+# change a live cluster while you are still learning. docs/github-actions-101.md
+# section 3 explains how to add one later, and why you would want branch
+# protection first.
+#
+# `inputs:` are the fields GitHub shows you in the "Run workflow" dialog.
+# -----------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Render and validate only -- do not install'
+        type: boolean
+        default: false
+
+# -----------------------------------------------------------------------------
+# `concurrency:` -- stop two runs from fighting over the same cluster.
+#
+# Runs that share a `group` name are serialised. `cancel-in-progress: false` is
+# the important half: we would rather queue behind a running deploy than kill it
+# halfway through a Helm install and leave the release in a `pending-upgrade`
+# state that needs manual repair. uninstall.yml uses the same group name, so a
+# deploy and an uninstall can never overlap either.
+# -----------------------------------------------------------------------------
+concurrency:
+  group: teleport-mvp
+  cancel-in-progress: false
+
+# -----------------------------------------------------------------------------
+# `permissions:` -- what the run's automatic GitHub token may do.
+#
+# GitHub mints a short-lived token for every run. We only need to read this
+# repository's own files, so we ask for exactly that and nothing else. Narrowing
+# permissions costs nothing and is a good habit.
+# -----------------------------------------------------------------------------
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # ONE job, called `deploy`, containing every step in order.
+  #
+  # This workflow could have been split into several jobs, but jobs run on
+  # separate machines with separate empty working directories, and passing data
+  # between them needs `needs:` and job outputs. None of that helps you here.
+  # One job with well-named steps reads top to bottom like a shell script.
+  # ---------------------------------------------------------------------------
+  deploy:
+    # `runs-on:` picks the machine. A *list* means "a runner carrying ALL of
+    # these labels". `self-hosted` and `linux` are labels GitHub adds to
+    # self-hosted Linux runners automatically; the third comes from the
+    # RUNNER_LABEL repository variable so you can name your runner whatever you
+    # like without editing this file.
+    #
+    # This job MUST run on a self-hosted runner: GitHub's own runners live in
+    # GitHub's cloud and cannot reach your Kubernetes API server.
+    runs-on: [self-hosted, linux, "${{ vars.RUNNER_LABEL }}"]
+
+    # A stuck deploy should give up rather than occupy the runner forever.
+    timeout-minutes: 20
+
+    # Make every `run:` block below use bash, so the shell syntax in this file
+    # is the same everywhere regardless of the runner's default shell.
+    defaults:
+      run:
+        shell: bash
+
+    # -------------------------------------------------------------------------
+    # `env:` -- copy the repository variables into environment variables once,
+    # here, so that the `run:` blocks below can use ordinary shell variables
+    # like "$K8S_NAMESPACE".
+    #
+    # This is not just tidiness. Writing ${{ vars.X }} directly inside a `run:`
+    # block pastes the value into the script *as text* before bash sees it, so a
+    # value containing a quote or a semicolon could change what the script does.
+    # Passing values through `env:` avoids that entirely. Get into this habit
+    # now; it matters much more once untrusted input is involved.
+    #
+    # `${{ vars.SERVICE_TYPE || 'LoadBalancer' }}` supplies a default: if the
+    # variable is unset (or empty), the right-hand side is used.
+    # -------------------------------------------------------------------------
+    env:
+      TELEPORT_VERSION: ${{ vars.TELEPORT_VERSION }}
+      TELEPORT_CLUSTER_NAME: ${{ vars.TELEPORT_CLUSTER_NAME }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      TLS_SECRET_NAME: ${{ vars.TLS_SECRET_NAME }}
+      LICENSE_SECRET_NAME: ${{ vars.LICENSE_SECRET_NAME }}
+      SERVICE_TYPE: ${{ vars.SERVICE_TYPE || 'LoadBalancer' }}
+      PUBLIC_ADDR: ${{ vars.PUBLIC_ADDR }}
+      STORAGE_CLASS: ${{ vars.STORAGE_CLASS }}
+      VOLUME_SIZE: ${{ vars.VOLUME_SIZE || '10Gi' }}
+      # Not configurable, and deliberately so: the Helm release name becomes
+      # part of every resource name and of the `app.kubernetes.io/instance`
+      # label. Changing it would orphan the previous release's resources.
+      HELM_RELEASE: teleport
+      CHART_REPO_URL: https://charts.releases.teleport.dev
+      # The chart's own labels, used everywhere below to find workloads by
+      # *label selector* instead of by guessed name. Resource names change
+      # between chart versions; these labels do not.
+      CHART_NAME_LABEL: teleport-cluster
+
+    steps:
+      # =======================================================================
+      # STEP 1 -- get this repository's files onto the runner.
+      # =======================================================================
+      # A job starts in an EMPTY directory. The runner does not have a copy of
+      # your repository until you ask for one, and `actions/checkout` is the
+      # official action that does the `git clone`. Without this step, the
+      # `helm/values.yaml` referenced further down would not exist.
+      #
+      # The `@3d3c42e5...` is a git commit SHA, not a version tag. Tags like
+      # `@v7` can be moved to point at different code by whoever owns the
+      # repository; a commit SHA cannot. Since actions run code on YOUR runner,
+      # which holds live Kubernetes credentials, pinning to a SHA means the code
+      # you reviewed is the code that runs. The trailing comment records which
+      # release that SHA corresponds to, for humans.
+      - name: Check out this repository onto the runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # =======================================================================
+      # STEP 2 -- print the configuration this run will use.
+      # =======================================================================
+      # Cheap, and it makes the abstract idea "settings live in repository
+      # variables" concrete: you can see the values you typed into the GitHub UI
+      # arriving in the run. None of these are secret.
+      #
+      # `$GITHUB_STEP_SUMMARY` is a file the runner gives every step. Anything
+      # you append to it (as Markdown) is rendered on the run's summary page, so
+      # you do not have to expand log steps to find the important bits.
+      - name: Show the configuration this run will use
+        run: |
+          set -euo pipefail
+
+          # A here-document is the readable way to emit a block of text. It is
+          # written twice -- once to the log, once to the summary page.
+          print_config() {
+            echo "Teleport / chart version : ${TELEPORT_VERSION}"
+            echo "Cluster name (DNS name)  : ${TELEPORT_CLUSTER_NAME}"
+            echo "Kubernetes namespace     : ${K8S_NAMESPACE}"
+            echo "TLS secret               : ${TLS_SECRET_NAME}"
+            echo "Licence secret           : ${LICENSE_SECRET_NAME}"
+            echo "Service type             : ${SERVICE_TYPE}"
+            echo "Public address override  : ${PUBLIC_ADDR:-<not set>}"
+            echo "Storage class            : ${STORAGE_CLASS:-<cluster default>}"
+            echo "Volume size              : ${VOLUME_SIZE}"
+            echo "Helm release name        : ${HELM_RELEASE}"
+            echo "Dry run                  : ${DRY_RUN}"
+          }
+
+          print_config
+
+          {
+            echo "## Configuration"
+            echo ""
+            echo '```'
+            print_config
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          # `inputs.dry_run` is the checkbox from the "Run workflow" dialog.
+          # It is passed in through `env:` for the same reason as the variables.
+          DRY_RUN: ${{ inputs.dry_run }}
+
+      # =======================================================================
+      # STEP 3 -- refuse to continue if a required variable is missing.
+      # =======================================================================
+      # This is the single most common first-run failure, and an empty variable
+      # would otherwise turn into a confusing Helm error several minutes later:
+      # `envsubst` replaces an unset variable with an empty string rather than
+      # complaining. Fail here instead, naming the exact variable.
+      - name: Check the required repository variables are set
+        run: |
+          set -euo pipefail
+          missing=()
+
+          # `${!name}` reads the variable whose *name* is in $name -- that is
+          # what lets one loop check them all.
+          for name in TELEPORT_VERSION TELEPORT_CLUSTER_NAME K8S_NAMESPACE \
+                      TLS_SECRET_NAME LICENSE_SECRET_NAME; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "These repository variables are empty or not set: ${missing[*]}"
+            echo "Set them under: Settings -> Secrets and variables -> Actions -> Variables."
+            echo "The full list, with examples, is in docs/setup.md step 6."
+            echo "::error title=Missing repository variables::${missing[*]} -- see docs/setup.md step 6"
+            exit 1
+          fi
+
+          # Only three service types are supported, and a typo here would reach
+          # Kubernetes as an invalid Service and fail in a much less obvious way.
+          case "${SERVICE_TYPE}" in
+            LoadBalancer|NodePort|ClusterIP) ;;
+            *)
+              echo "SERVICE_TYPE must be LoadBalancer, NodePort or ClusterIP; got '${SERVICE_TYPE}'."
+              echo "::error title=Invalid SERVICE_TYPE::'${SERVICE_TYPE}' is not one of LoadBalancer, NodePort, ClusterIP"
+              exit 1
+              ;;
+          esac
+
+          # The NodePort trap, caught before we touch the cluster. With
+          # SERVICE_TYPE=NodePort the chart still advertises port 443 to
+          # clients, while the Service actually listens on a port in the
+          # 30000-32767 range. PUBLIC_ADDR corrects that, so it is mandatory.
+          # See the long comment at the top of helm/values.nodeport.yaml.
+          if [[ "${SERVICE_TYPE}" == "NodePort" && -z "${PUBLIC_ADDR:-}" ]]; then
+            echo "SERVICE_TYPE is NodePort, so PUBLIC_ADDR must also be set."
+            echo "It needs the host AND the node port, for example:"
+            echo "    PUBLIC_ADDR=${TELEPORT_CLUSTER_NAME}:32443"
+            echo "Without it, Teleport tells clients to connect on port 443, where nothing listens."
+            echo "If you do not know the port yet, deploy with SERVICE_TYPE=NodePort once;"
+            echo "this workflow prints the assigned node port at the end, and you then set"
+            echo "PUBLIC_ADDR and re-run. See helm/values.nodeport.yaml and docs/runbook.md."
+            echo "::error title=PUBLIC_ADDR is required for NodePort::Set PUBLIC_ADDR to ${TELEPORT_CLUSTER_NAME}:<nodePort>"
+            exit 1
+          fi
+
+          echo "All required variables are present."
+
+      # =======================================================================
+      # STEP 4 -- check the command-line tools this workflow needs.
+      # =======================================================================
+      # Unlike GitHub-hosted runners, which come loaded with software, YOUR
+      # runner has only what you installed. runner/install-runner.sh installs
+      # all of these. Checking them here turns "helm: command not found" buried
+      # in step 12 into a clear message in step 4.
+      - name: Check the required command-line tools are installed
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in kubectl helm jq openssl envsubst curl base64; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Not found on this runner's PATH: ${missing[*]}"
+            echo "Re-run runner/install-runner.sh on the runner VM, which installs all of them."
+            echo "(envsubst is part of the 'gettext' package; the others are their own packages.)"
+            echo "::error title=Missing tools on the runner::${missing[*]} -- see runner/install-runner.sh"
+            exit 1
+          fi
+
+          # Print versions: when something behaves oddly later, the first
+          # question is always "which version?", and the answer is now in the log.
+          kubectl version --client
+          helm version
+          echo "jq      $(jq --version)"
+          openssl version
+
+      # =======================================================================
+      # STEP 5 -- check the runner can actually talk to Kubernetes.
+      # =======================================================================
+      # THIS IS THE MOST LIKELY THING TO FAIL ON YOUR FIRST RUN, and the whole
+      # reason this step exists separately: without it, broken credentials show
+      # up ten minutes later as an unexplained Helm timeout.
+      #
+      # This workflow does not create, refresh or even look at credentials. It
+      # only checks that whatever the runner already has works.
+      - name: Check the runner can reach the Kubernetes cluster
+        run: |
+          set -euo pipefail
+
+          if ! kubectl cluster-info; then
+            echo ""
+            echo "The runner's Kubernetes credentials are not working."
+            echo "This workflow does not manage them -- see docs/setup.md step 5."
+            echo ""
+            echo "Things to check, as the 'github-runner' user ON THE RUNNER VM:"
+            echo "  * does 'kubectl config current-context' show the cluster you expect?"
+            echo "  * does 'kubectl get ns' succeed?"
+            echo "  * if you use Teleport MWI / tbot: is the tbot service running and its"
+            echo "    output still valid? Short-lived credentials expire."
+            echo "  * is KUBECONFIG set for the github-runner user's environment (not just"
+            echo "    for your interactive shell)?"
+            echo "::error title=Cannot reach the Kubernetes cluster::The runner's credentials are not working -- see docs/setup.md step 5"
+            exit 1
+          fi
+
+          # Permission checks. Reaching the API server is not the same as being
+          # allowed to do anything, and an RBAC gap otherwise surfaces as a
+          # partially-applied Helm release. Each entry is "verb resource".
+          echo ""
+          echo "Checking permissions in namespace '${K8S_NAMESPACE}':"
+          denied=()
+          while read -r verb resource; do
+            [[ -z "$verb" ]] && continue
+            if kubectl auth can-i "$verb" "$resource" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+              printf '  yes  %s %s\n' "$verb" "$resource"
+            else
+              printf '  NO   %s %s\n' "$verb" "$resource"
+              denied+=("$verb $resource")
+            fi
+          done <<'PERMISSIONS'
+          get secrets
+          get namespaces
+          create deployments
+          create services
+          create configmaps
+          create serviceaccounts
+          create persistentvolumeclaims
+          create jobs
+          get pods
+          create pods/exec
+          PERMISSIONS
+
+          if [[ ${#denied[@]} -gt 0 ]]; then
+            echo ""
+            echo "The runner's credentials are missing these permissions in '${K8S_NAMESPACE}':"
+            for item in "${denied[@]}"; do echo "  * ${item}"; done
+            echo "docs/setup.md step 5 lists the minimum RBAC this project needs."
+            echo "::error title=Insufficient Kubernetes permissions::Missing: ${denied[*]} -- see docs/setup.md step 5"
+            exit 1
+          fi
+
+          # Cluster-scoped RBAC is a WARNING, not an error: the chart creates a
+          # ClusterRole and ClusterRoleBindings, but an operator may legitimately
+          # have pre-created those and passed `rbac.create=false`. We cannot tell
+          # from here, so we report and continue.
+          if ! kubectl auth can-i create clusterroles >/dev/null 2>&1; then
+            echo ""
+            echo "::warning title=No permission to create ClusterRoles::The chart creates cluster-scoped RBAC. If the install fails on a ClusterRole, see docs/setup.md step 5."
+          fi
+
+      # =======================================================================
+      # STEP 6 -- check the namespace exists. Do NOT create it.
+      # =======================================================================
+      # Creating it would be one line, and would be wrong. The namespace is
+      # supposed to already contain two secrets that you provisioned by hand. An
+      # empty namespace conjured up here would let the run get two steps further
+      # and then fail on a missing secret -- a worse error, further from the
+      # actual cause, which is that you are pointing at the wrong namespace or
+      # have not done docs/setup.md step 1 yet.
+      - name: Check the Kubernetes namespace already exists
+        run: |
+          set -euo pipefail
+          if ! kubectl get namespace "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Namespace '${K8S_NAMESPACE}' does not exist (or you cannot see it)."
+            echo "This workflow does not create it on purpose: the namespace must already"
+            echo "hold the TLS secret and the licence secret that you created by hand."
+            echo ""
+            echo "Create it and its secrets as described in docs/setup.md steps 1-3:"
+            echo "    kubectl create namespace ${K8S_NAMESPACE}"
+            echo ""
+            echo "If you meant a different namespace, fix the K8S_NAMESPACE repository variable."
+            echo "::error title=Namespace does not exist::'${K8S_NAMESPACE}' not found -- see docs/setup.md steps 1-3"
+            exit 1
+          fi
+          echo "Namespace '${K8S_NAMESPACE}' exists."
+
+      # =======================================================================
+      # STEP 7 -- inspect the TLS certificate.
+      # =======================================================================
+      # A certificate that does not cover your cluster name produces a
+      # *successful* deploy and then browser warnings for every user, discovered
+      # days later. Checking it takes two seconds, so we check it.
+      #
+      # Only `tls.crt` is decoded. A certificate is public information -- it is
+      # sent to every client that connects. `tls.key` is the private key: this
+      # workflow never decodes it, never prints it and never writes it to disk.
+      - name: Check the TLS secret and inspect the certificate
+        run: |
+          set -euo pipefail
+
+          if ! kubectl get secret "${TLS_SECRET_NAME}" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Secret '${TLS_SECRET_NAME}' not found in namespace '${K8S_NAMESPACE}'."
+            echo "Create it from your certificate and key (docs/setup.md step 2):"
+            echo "    kubectl create secret tls ${TLS_SECRET_NAME} \\"
+            echo "      --cert=fullchain.pem --key=privkey.pem -n ${K8S_NAMESPACE}"
+            echo "::error title=TLS secret not found::'${TLS_SECRET_NAME}' missing from '${K8S_NAMESPACE}' -- see docs/setup.md step 2"
+            exit 1
+          fi
+
+          # The chart expects a standard `kubernetes.io/tls` secret, because that
+          # is what puts the data under the keys `tls.crt` and `tls.key` that it
+          # mounts at /etc/teleport-tls/.
+          secret_json="$(kubectl get secret "${TLS_SECRET_NAME}" -n "${K8S_NAMESPACE}" -o json)"
+          secret_type="$(jq -r '.type' <<<"${secret_json}")"
+          if [[ "${secret_type}" != "kubernetes.io/tls" ]]; then
+            echo "Secret '${TLS_SECRET_NAME}' has type '${secret_type}', not 'kubernetes.io/tls'."
+            echo "Re-create it with 'kubectl create secret tls' (docs/setup.md step 2), which sets the type for you."
+            echo "::error title=Wrong TLS secret type::'${TLS_SECRET_NAME}' is '${secret_type}', expected 'kubernetes.io/tls'"
+            exit 1
+          fi
+
+          # Report which keys are present, then require both. This lists key
+          # NAMES only -- never values.
+          echo "Keys in secret '${TLS_SECRET_NAME}': $(jq -r '.data | keys | join(", ")' <<<"${secret_json}")"
+          for key in 'tls.crt' 'tls.key'; do
+            if ! jq -e --arg k "${key}" '.data | has($k)' <<<"${secret_json}" >/dev/null; then
+              echo "Secret '${TLS_SECRET_NAME}' has no '${key}' key."
+              echo "::error title=TLS secret is incomplete::'${TLS_SECRET_NAME}' is missing '${key}'"
+              exit 1
+            fi
+          done
+
+          # $RUNNER_TEMP is a scratch directory the runner cleans up. Writing the
+          # certificate there (and only the certificate) keeps it out of the
+          # checked-out repository.
+          cert="${RUNNER_TEMP}/tls.crt"
+          jq -r '.data["tls.crt"]' <<<"${secret_json}" | base64 -d > "${cert}"
+
+          echo ""
+          echo "Certificate subject : $(openssl x509 -in "${cert}" -noout -subject)"
+          echo "Certificate issuer  : $(openssl x509 -in "${cert}" -noout -issuer)"
+          echo "Valid from          : $(openssl x509 -in "${cert}" -noout -startdate | cut -d= -f2-)"
+          echo "Valid until         : $(openssl x509 -in "${cert}" -noout -enddate | cut -d= -f2-)"
+
+          # --- Check 1: does the certificate actually cover our cluster name? --
+          # Browsers match the Subject Alternative Names (SANs); the older
+          # Common Name (CN) is checked too for completeness. A wildcard SAN like
+          # `*.example.com` covers `teleport.example.com`, so build the wildcard
+          # form of our name and compare against that as well.
+          common_name="$(openssl x509 -in "${cert}" -noout -subject \
+            | tr ',/' '\n' | sed -n 's/.*CN *= *//p' | head -1)"
+          sans="$(openssl x509 -in "${cert}" -noout -ext subjectAltName 2>/dev/null \
+            | tr ',' '\n' | sed -n 's/.*DNS: *//p')"
+          wildcard_form="*.${TELEPORT_CLUSTER_NAME#*.}"
+
+          matched=no
+          while read -r name; do
+            [[ -z "${name}" ]] && continue
+            if [[ "${name}" == "${TELEPORT_CLUSTER_NAME}" || "${name}" == "${wildcard_form}" ]]; then
+              matched=yes
+            fi
+          done <<<"${common_name}
+          ${sans}"
+
+          echo "Names on the certificate: $(echo "${common_name} ${sans}" | tr '\n' ' ')"
+          if [[ "${matched}" != "yes" ]]; then
+            echo ""
+            echo "This certificate does NOT cover '${TELEPORT_CLUSTER_NAME}'."
+            echo "Every client would see a name-mismatch error, and Teleport would still"
+            echo "start happily -- which is why this is checked here and not discovered later."
+            echo "Either re-issue the certificate for '${TELEPORT_CLUSTER_NAME}', or fix the"
+            echo "TELEPORT_CLUSTER_NAME repository variable to match the certificate."
+            echo "::error title=Certificate name mismatch::'${TELEPORT_CLUSTER_NAME}' is not on the certificate in '${TLS_SECRET_NAME}'"
+            exit 1
+          fi
+          echo "OK: '${TELEPORT_CLUSTER_NAME}' is covered by the certificate."
+
+          # --- Check 2: expiry -----------------------------------------------
+          # `-checkend N` exits non-zero if the certificate expires within the
+          # next N seconds. 0 means "already expired"; 2592000 is 30 days.
+          not_after="$(openssl x509 -in "${cert}" -noout -enddate | cut -d= -f2-)"
+          if ! openssl x509 -in "${cert}" -noout -checkend 0 >/dev/null 2>&1; then
+            echo "This certificate EXPIRED on ${not_after}."
+            echo "Replace the secret before deploying (docs/runbook.md, 'Renew the certificate')."
+            echo "::error title=Certificate has expired::Expired ${not_after}"
+            exit 1
+          fi
+          if ! openssl x509 -in "${cert}" -noout -checkend 2592000 >/dev/null 2>&1; then
+            echo "::warning title=Certificate expires soon::Expires ${not_after} (less than 30 days). Renewing needs no redeploy -- see docs/runbook.md."
+          fi
+
+          # --- Check 3: will clients trust the issuer? -----------------------
+          # Warnings, not errors: a self-signed certificate is a perfectly
+          # reasonable way to try this out, as long as you know that is what you
+          # have and are ready for the client-side trust warnings.
+          issuer="$(openssl x509 -in "${cert}" -noout -issuer | sed 's/^issuer=//')"
+          subject="$(openssl x509 -in "${cert}" -noout -subject | sed 's/^subject=//')"
+          if [[ "${issuer}" == "${subject}" ]]; then
+            echo "::warning title=Self-signed certificate::Issuer equals subject, so no client will trust this certificate without extra configuration. Teleport will start and serve it regardless."
+          fi
+          case "${issuer}" in
+            *STAGING*|*staging*|*"Fake LE"*)
+              echo "::warning title=Let's Encrypt STAGING certificate::Staging certificates are not trusted by browsers or tsh. Re-issue against the production ACME endpoint before real use."
+              ;;
+          esac
+
+          # Publish the expiry date for the final summary step. Appending
+          # `NAME=value` to $GITHUB_ENV makes it an environment variable in every
+          # LATER step of this job -- the standard way to pass a value along.
+          echo "CERT_NOT_AFTER=${not_after}" >> "$GITHUB_ENV"
+
+          # The certificate is public, but there is no reason to leave it lying
+          # around on a long-lived self-hosted runner.
+          rm -f "${cert}"
+
+      # =======================================================================
+      # STEP 8 -- check the licence secret's key NAME.
+      # =======================================================================
+      # The chart mounts this secret at /var/lib/license/license.pem and tells
+      # Teleport to read that exact path. If the key inside the secret is called
+      # anything else -- `license`, `teleport.pem`, `license.pem.txt` -- the file
+      # appears under the wrong name, Teleport cannot find its licence, and the
+      # pod crash-loops with a message that does not mention the secret at all.
+      #
+      # We check the key NAME only. The licence is commercial data; its value is
+      # never decoded or printed.
+      - name: Check the licence secret has a license.pem key
+        run: |
+          set -euo pipefail
+
+          if ! kubectl get secret "${LICENSE_SECRET_NAME}" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Secret '${LICENSE_SECRET_NAME}' not found in namespace '${K8S_NAMESPACE}'."
+            echo "Create it from your Teleport Enterprise licence file (docs/setup.md step 3):"
+            echo "    kubectl create secret generic ${LICENSE_SECRET_NAME} \\"
+            echo "      --from-file=license.pem=license.pem -n ${K8S_NAMESPACE}"
+            echo "::error title=Licence secret not found::'${LICENSE_SECRET_NAME}' missing from '${K8S_NAMESPACE}' -- see docs/setup.md step 3"
+            exit 1
+          fi
+
+          keys="$(kubectl get secret "${LICENSE_SECRET_NAME}" -n "${K8S_NAMESPACE}" \
+            -o json | jq -r '.data | keys | join(", ")')"
+          echo "Keys in secret '${LICENSE_SECRET_NAME}': ${keys}"
+
+          if ! kubectl get secret "${LICENSE_SECRET_NAME}" -n "${K8S_NAMESPACE}" \
+               -o json | jq -e '.data | has("license.pem")' >/dev/null; then
+            echo ""
+            echo "Secret '${LICENSE_SECRET_NAME}' has no key named exactly 'license.pem'."
+            echo "It has: ${keys}"
+            echo "The chart mounts this secret at /var/lib/license/license.pem, so the key name"
+            echo "must match. The '--from-file=license.pem=<your file>' form sets the key name"
+            echo "explicitly, which is why docs/setup.md step 3 uses it:"
+            echo "    kubectl create secret generic ${LICENSE_SECRET_NAME} \\"
+            echo "      --from-file=license.pem=/path/to/your/license.pem -n ${K8S_NAMESPACE}"
+            echo "::error title=Licence secret has the wrong key name::'${LICENSE_SECRET_NAME}' needs a 'license.pem' key; it has: ${keys}"
+            exit 1
+          fi
+          echo "OK: 'license.pem' key present."
+
+      # =======================================================================
+      # STEP 9 -- check the requested chart version exists, and fetch it.
+      # =======================================================================
+      # A typo in TELEPORT_VERSION is caught here in two seconds instead of after
+      # a failed image pull. We also download the chart to a local directory,
+      # because `helm lint` in step 11 needs a chart on disk and has no
+      # `--version` flag of its own.
+      - name: Check the Teleport chart version exists and download it
+        run: |
+          set -euo pipefail
+
+          # `--force-update` makes this idempotent: on a self-hosted runner the
+          # repo may already be configured from a previous run, and without this
+          # flag Helm errors out instead of shrugging.
+          helm repo add teleport "${CHART_REPO_URL}" --force-update
+          helm repo update teleport
+
+          found="$(helm search repo teleport/teleport-cluster \
+            --version "${TELEPORT_VERSION}" --output json | jq -r '.[0].version // empty')"
+
+          # Exact string equality, not "did Helm find something": Helm treats
+          # --version as a semver *range*, so a typo like `18.11` would happily
+          # match some other release.
+          if [[ "${found}" != "${TELEPORT_VERSION}" ]]; then
+            echo "No teleport-cluster chart with the exact version '${TELEPORT_VERSION}'."
+            echo "Helm's closest match was: '${found:-none}'."
+            echo ""
+            echo "Recent available versions:"
+            helm search repo teleport/teleport-cluster --versions --output json \
+              | jq -r '.[0:10][] | "  " + .version'
+            echo ""
+            echo "Fix the TELEPORT_VERSION repository variable to one of these."
+            echo "::error title=Chart version not found::teleport-cluster '${TELEPORT_VERSION}' does not exist"
+            exit 1
+          fi
+          echo "OK: chart teleport-cluster ${TELEPORT_VERSION} exists."
+
+          # Unpack into ./chart/teleport-cluster. `rm -rf` first because a
+          # self-hosted runner reuses its working directory between runs and a
+          # stale copy of a different version would be worse than no copy.
+          rm -rf chart
+          mkdir -p chart
+          helm pull teleport/teleport-cluster --version "${TELEPORT_VERSION}" \
+            --untar --untardir chart
+          echo "Chart unpacked to ./chart/teleport-cluster"
+
+      # =======================================================================
+      # STEP 10 -- turn the values template into a real values file.
+      # =======================================================================
+      # helm/values.yaml is a *template* containing ${PLACEHOLDERS}. `envsubst`
+      # replaces each one with the matching environment variable -- which, thanks
+      # to the job-level `env:` block, is the repository variable you set in the
+      # GitHub UI.
+      #
+      # There are two templates rather than one file full of conditionals,
+      # because NodePort needs an extra `publicAddr` key that envsubst cannot
+      # add conditionally. Two files you can read beat one you have to simulate.
+      #
+      # Printing the result is the clearest possible explanation of what
+      # templating did: what you see here is exactly what Helm receives.
+      - name: Render the Helm values file from the template
+        run: |
+          set -euo pipefail
+
+          if [[ "${SERVICE_TYPE}" == "NodePort" ]]; then
+            template="helm/values.nodeport.yaml"
+          else
+            template="helm/values.yaml"
+          fi
+          echo "Using template: ${template} (SERVICE_TYPE=${SERVICE_TYPE})"
+
+          # Naming the variables explicitly (in single quotes, so the shell does
+          # not expand them first) tells envsubst to touch ONLY these. Any other
+          # dollar sign in the template is left alone, which avoids nasty
+          # surprises if the file ever gains a shell-like string.
+          #
+          # The `shellcheck disable` line below silences shellcheck's usual and
+          # normally-correct advice that "${X}" in single quotes will not expand.
+          # Here that is exactly the point: envsubst wants the literal text.
+          # shellcheck disable=SC2016
+          envsubst \
+            '${TELEPORT_CLUSTER_NAME} ${TLS_SECRET_NAME} ${LICENSE_SECRET_NAME} ${SERVICE_TYPE} ${PUBLIC_ADDR} ${STORAGE_CLASS} ${VOLUME_SIZE}' \
+            < "${template}" > rendered-values.yaml
+
+          # Strip the comments for the printed copy: the template's comments are
+          # long and you have already read them. Values only, for review.
+          echo ""
+          echo "--- rendered-values.yaml (comments removed) ---"
+          grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' rendered-values.yaml
+
+          {
+            echo "## Rendered Helm values"
+            echo ""
+            echo '```yaml'
+            grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' rendered-values.yaml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # A placeholder left behind means a variable was not exported: catch it
+          # now rather than letting Helm receive a literal "${...}" string.
+          # Single quotes again keep the dollar sign literal for grep.
+          # shellcheck disable=SC2016
+          if grep -q '\${' rendered-values.yaml; then
+            echo "Unsubstituted placeholders remain in rendered-values.yaml:"
+            # shellcheck disable=SC2016
+            grep -n '\${' rendered-values.yaml
+            echo "::error title=Template not fully rendered::A \${PLACEHOLDER} was left in rendered-values.yaml"
+            exit 1
+          fi
+
+      # =======================================================================
+      # STEP 11 -- ask Helm to check its own work, without touching the cluster.
+      # =======================================================================
+      # `helm lint` checks the chart and values for structural problems.
+      # `helm template` renders the full set of Kubernetes manifests locally --
+      # this is where a bad values combination (for example setting both `acme`
+      # and `tls.existingSecretName`, which the chart refuses outright) shows up.
+      #
+      # Both run on every run, dry run or not: there is no reason to skip a free
+      # check, and on a dry run this is the whole point.
+      - name: Validate the chart and values without touching the cluster
+        run: |
+          set -euo pipefail
+
+          # `--namespace` matters even for local rendering: the chart writes the
+          # namespace into service addresses inside the generated config.
+          helm lint chart/teleport-cluster \
+            --values rendered-values.yaml \
+            --namespace "${K8S_NAMESPACE}"
+
+          helm template "${HELM_RELEASE}" chart/teleport-cluster \
+            --values rendered-values.yaml \
+            --namespace "${K8S_NAMESPACE}" > rendered-manifests.yaml
+
+          echo "Rendered $(grep -c '^kind:' rendered-manifests.yaml) Kubernetes objects:"
+          grep '^kind:' rendered-manifests.yaml | sort | uniq -c
+
+          # Three facts worth asserting, because each has bitten someone:
+          #   * the ENTERPRISE image, since `enterprise: true` is what selects it
+          #     and a silent fall-back to the OSS image would fail on the licence;
+          #   * https_keypairs, proving the operator-provided certificate is
+          #     actually wired in rather than ACME;
+          #   * replicas: 1, because the SQLite backend cannot be scaled.
+          echo ""
+          echo "Image      : $(grep -m1 'image:' rendered-manifests.yaml | sed 's/^ *//')"
+          echo "TLS wiring : $(grep -m1 -A2 'https_keypairs:' rendered-manifests.yaml | tr -s ' \n' ' ')"
+          echo "Licence    : $(grep -m1 'license_file:' rendered-manifests.yaml | sed 's/^ *//')"
+          echo "Advertised : $(grep -m1 -A1 'public_addr' rendered-manifests.yaml | grep -v auth | tr -s ' \n' ' ')"
+
+          if ! grep -q 'teleport-ent-distroless' rendered-manifests.yaml; then
+            echo "::error title=Not the Enterprise image::The rendered manifests do not use teleport-ent-distroless; check 'enterprise: true' in the values template."
+            exit 1
+          fi
+          if ! grep -q 'https_keypairs:' rendered-manifests.yaml; then
+            echo "::error title=Certificate not wired in::No https_keypairs in the rendered config; check 'tls.existingSecretName' in the values template."
+            exit 1
+          fi
+          if grep -E '^  replicas: [2-9]' rendered-manifests.yaml; then
+            echo "::error title=More than one replica::chartMode standalone uses SQLite on a ReadWriteOnce volume and cannot be scaled. Keep replicaCount at 1."
+            exit 1
+          fi
+          echo ""
+          echo "Validation passed."
+
+      # =======================================================================
+      # STEP 12 -- the fork in the road: dry run stops here.
+      # =======================================================================
+      # Everything above is read-only. Everything below changes your cluster.
+      #
+      # Each step from here on carries `if: ${{ !inputs.dry_run }}`, which means
+      # "skip this step when the dry_run checkbox was ticked". Skipped steps are
+      # shown greyed out in the run, so you can still see what *would* have
+      # happened -- which is more instructive than hiding them.
+      - name: Stop here, because this was a dry run
+        if: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          echo "dry_run was ticked, so nothing was installed or changed."
+          echo "Everything above -- credentials, namespace, both secrets, the certificate,"
+          echo "the chart version and the rendered manifests -- has been verified."
+          echo "Re-run with dry_run unticked to install for real."
+          {
+            echo "## Dry run -- nothing was installed"
+            echo ""
+            echo "All preflight checks passed. Re-run with **dry_run unticked** to install."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # =======================================================================
+      # STEP 13 -- install, or upgrade if it is already there.
+      # =======================================================================
+      # `helm upgrade --install` is the reason this workflow is safe to press
+      # twice: if the release does not exist Helm installs it, and if it does
+      # Helm upgrades it. There is no separate "first time" command to remember
+      # and no "release already exists" failure on the second run.
+      #
+      # `--wait` makes Helm block until the pods it created are actually Ready,
+      # so a green step means a running cluster rather than merely "manifests
+      # accepted". `--timeout 10m` bounds that wait; the failure diagnostics step
+      # at the bottom of this file explains what to look at if it is hit.
+      - name: Install or upgrade the Teleport Helm release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          helm upgrade --install "${HELM_RELEASE}" chart/teleport-cluster \
+            --namespace "${K8S_NAMESPACE}" \
+            --values rendered-values.yaml \
+            --wait --timeout 10m
+
+          echo ""
+          helm status "${HELM_RELEASE}" -n "${K8S_NAMESPACE}"
+
+      # =======================================================================
+      # STEP 14 -- confirm both workloads finished rolling out.
+      # =======================================================================
+      # `helm --wait` already waited, but this reports per-workload status, which
+      # is what you want in the log when only one of the two is unhappy.
+      #
+      # The Deployment names are looked up by LABEL SELECTOR rather than typed
+      # in. Chart authors rename resources between versions; the
+      # `app.kubernetes.io/*` labels are a convention they keep.
+      - name: Wait for the auth and proxy pods to be ready
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          for component in auth proxy; do
+            selector="app.kubernetes.io/name=${CHART_NAME_LABEL}"
+            selector="${selector},app.kubernetes.io/instance=${HELM_RELEASE}"
+            selector="${selector},app.kubernetes.io/component=${component}"
+
+            name="$(kubectl get deployment -n "${K8S_NAMESPACE}" -l "${selector}" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+            if [[ -z "${name}" ]]; then
+              echo "No Deployment found with labels: ${selector}"
+              echo "The chart may have changed its labels in version ${TELEPORT_VERSION}."
+              echo "Run 'kubectl get deploy -n ${K8S_NAMESPACE} --show-labels' to see what exists."
+              echo "::error title=Cannot find the ${component} Deployment::No Deployment matches ${selector}"
+              exit 1
+            fi
+
+            echo "Waiting for deployment/${name} (${component})..."
+            kubectl rollout status "deployment/${name}" -n "${K8S_NAMESPACE}" --timeout=5m
+          done
+
+          echo ""
+          kubectl get pods -n "${K8S_NAMESPACE}" -o wide
+
+      # =======================================================================
+      # STEP 15 -- find the address you must point DNS at.
+      # =======================================================================
+      # Teleport is now running, but nobody can reach it by name until a DNS
+      # record exists. What that record should contain depends entirely on the
+      # Service type, so all three cases are handled explicitly and the answer is
+      # printed rather than left for you to work out.
+      - name: Find the address to point DNS at
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # The proxy Service, again found by label rather than by name.
+          selector="app.kubernetes.io/name=${CHART_NAME_LABEL}"
+          selector="${selector},app.kubernetes.io/instance=${HELM_RELEASE}"
+          selector="${selector},app.kubernetes.io/component=proxy"
+          service="$(kubectl get service -n "${K8S_NAMESPACE}" -l "${selector}" \
+            -o jsonpath='{.items[0].metadata.name}')"
+          echo "Proxy Service: ${service} (type ${SERVICE_TYPE})"
+
+          address=""
+
+          case "${SERVICE_TYPE}" in
+            LoadBalancer)
+              # A cloud load balancer takes a while to appear, so poll for up to
+              # three minutes. Providers fill in EITHER `.hostname` (AWS) OR
+              # `.ip` (most others), so check both.
+              echo "Waiting up to 3 minutes for the load balancer address..."
+              for _ in $(seq 1 36); do
+                address="$(kubectl get service "${service}" -n "${K8S_NAMESPACE}" \
+                  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+                if [[ -z "${address}" ]]; then
+                  address="$(kubectl get service "${service}" -n "${K8S_NAMESPACE}" \
+                    -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+                fi
+                [[ -n "${address}" ]] && break
+                sleep 5
+              done
+
+              if [[ -z "${address}" ]]; then
+                # This is a specific, common and otherwise baffling situation, so
+                # it gets a specific message instead of a bare timeout. The
+                # Service will sit at EXTERNAL-IP <pending> forever.
+                echo ""
+                kubectl get service "${service}" -n "${K8S_NAMESPACE}"
+                echo ""
+                echo "The Service is stuck with no external address (EXTERNAL-IP <pending>)."
+                echo "This almost always means the cluster has NO LOAD BALANCER CONTROLLER:"
+                echo "nothing is listening for LoadBalancer Services, so none is ever created."
+                echo "That is normal for bare-metal, kubeadm, k3s-without-servicelb and most"
+                echo "home-lab clusters."
+                echo ""
+                echo "Two fixes, both fine:"
+                echo "  1. Set the SERVICE_TYPE repository variable to 'NodePort' and re-run."
+                echo "     You will also need PUBLIC_ADDR -- see helm/values.nodeport.yaml."
+                echo "  2. Install a load balancer implementation such as MetalLB, then re-run."
+                echo ""
+                echo "Teleport itself installed correctly; only its external address is missing."
+                echo "::error title=LoadBalancer never got an address::No load balancer controller in this cluster. Use SERVICE_TYPE=NodePort, or install MetalLB. See docs/runbook.md."
+                exit 1
+              fi
+              echo "Load balancer address: ${address}"
+              echo "DNS_TARGET=${address}" >> "$GITHUB_ENV"
+              ;;
+
+            NodePort)
+              # The port Kubernetes picked. It is NOT 443, and it is not chosen
+              # by us -- see helm/values.nodeport.yaml for why it cannot be.
+              node_port="$(kubectl get service "${service}" -n "${K8S_NAMESPACE}" \
+                -o jsonpath='{.spec.ports[0].nodePort}')"
+              echo "Assigned node port: ${node_port}"
+              echo ""
+              echo "Nodes (point DNS at any of these, they all forward to the proxy):"
+              kubectl get nodes -o wide
+
+              # Prefer an external node IP; fall back to the internal one, which
+              # is all a private cluster has.
+              address="$(kubectl get nodes \
+                -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')"
+              if [[ -z "${address}" ]]; then
+                address="$(kubectl get nodes \
+                  -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+                echo ""
+                echo "::notice title=Using an internal node IP::These nodes have no ExternalIP, so the address below is only reachable from inside your network."
+              fi
+              echo "DNS_TARGET=${address}" >> "$GITHUB_ENV"
+              echo "NODE_PORT=${node_port}" >> "$GITHUB_ENV"
+
+              # If the operator's PUBLIC_ADDR names a different port from the one
+              # Kubernetes actually assigned, clients get sent to a dead port.
+              # This can happen after the Service is deleted and recreated.
+              if [[ "${PUBLIC_ADDR}" != *":${node_port}" ]]; then
+                echo "::warning title=PUBLIC_ADDR does not match the assigned node port::PUBLIC_ADDR is '${PUBLIC_ADDR}' but the Service is on port ${node_port}. Update PUBLIC_ADDR to '${TELEPORT_CLUSTER_NAME}:${node_port}' and re-run, or clients will be told the wrong port."
+              fi
+              ;;
+
+            ClusterIP)
+              address="$(kubectl get service "${service}" -n "${K8S_NAMESPACE}" \
+                -o jsonpath='{.spec.clusterIP}')"
+              echo "ClusterIP: ${address}"
+              echo ""
+              echo "A ClusterIP is reachable only from inside the cluster. To use Teleport"
+              echo "from your laptop you need either an Ingress or Gateway in front of it, or"
+              echo "a port-forward for a quick look:"
+              echo "    kubectl port-forward -n ${K8S_NAMESPACE} service/${service} 443:443"
+              echo "Setting either up is out of scope for this MVP."
+              echo "DNS_TARGET=${address}" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      # =======================================================================
+      # STEP 16 -- prove TLS works, without waiting for DNS.
+      # =======================================================================
+      # The useful trick in this whole workflow. `curl --resolve host:port:ADDRESS`
+      # tells curl "when you look up this hostname, use this address" -- so curl
+      # connects to the new cluster while still sending the real hostname in SNI
+      # and validating the certificate against it. That means you can test the
+      # certificate BEFORE creating any DNS record.
+      #
+      # A failure here is a WARNING, not an error. The deploy itself succeeded;
+      # this check can fail for reasons that are nothing to do with Teleport --
+      # a firewall between the runner and the load balancer, a load balancer
+      # still warming up, or a certificate chain the runner does not trust.
+      - name: Check the cluster answers on HTTPS with the right certificate
+        if: ${{ !inputs.dry_run }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DNS_TARGET:-}" ]]; then
+            echo "::warning title=Skipped the TLS check::No address was found for the Service, so there is nothing to connect to."
+            exit 0
+          fi
+
+          # `--resolve` needs an IP address, so turn a load balancer hostname
+          # (AWS gives you one of those) into one first.
+          target="${DNS_TARGET}"
+          if [[ ! "${target}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "'${target}' is a hostname; resolving it to an IP for --resolve..."
+            resolved="$(getent hosts "${target}" | awk 'NR==1 {print $1}' || true)"
+            if [[ -z "${resolved}" ]]; then
+              echo "::warning title=Could not resolve the load balancer hostname::'${target}' does not resolve yet from the runner. This is common for a brand-new load balancer; retry the check in a few minutes."
+              exit 0
+            fi
+            target="${resolved}"
+            echo "Resolved to ${target}"
+          fi
+
+          # For NodePort the real port is the node port, not 443. The hostname in
+          # the URL stays the cluster name either way, which is what makes the
+          # certificate check meaningful.
+          port="${NODE_PORT:-443}"
+
+          echo "Connecting to ${target}:${port} while pretending to be ${TELEPORT_CLUSTER_NAME}..."
+          if ! curl --fail --show-error --silent --max-time 30 \
+                 --resolve "${TELEPORT_CLUSTER_NAME}:${port}:${target}" \
+                 "https://${TELEPORT_CLUSTER_NAME}:${port}/webapi/ping" > ping.json; then
+            echo "::warning title=Could not reach the cluster over HTTPS yet::The deploy itself succeeded. Common causes: the load balancer is still warming up, a firewall sits between the runner and it, or the runner does not trust your certificate's issuer (see the issuer warnings above). Retry with: curl --resolve ${TELEPORT_CLUSTER_NAME}:${port}:${target} https://${TELEPORT_CLUSTER_NAME}:${port}/webapi/ping"
+            exit 0
+          fi
+
+          echo "Response from /webapi/ping:"
+          jq . ping.json
+
+          # /webapi/ping reports the running server's version. Comparing it with
+          # what we asked for confirms the new pods are the ones answering, not
+          # leftovers from a previous revision.
+          server_version="$(jq -r '.server_version // empty' ping.json)"
+          if [[ "${server_version}" == "${TELEPORT_VERSION}" ]]; then
+            echo "OK: the cluster is serving Teleport ${server_version} on the expected certificate."
+          else
+            echo "::warning title=Version mismatch::/webapi/ping reports '${server_version}' but TELEPORT_VERSION is '${TELEPORT_VERSION}'. If you just upgraded, an old pod may still be answering; re-run this workflow or check 'kubectl get pods'."
+          fi
+          rm -f ping.json
+
+      # =======================================================================
+      # STEP 17 -- write the summary page: what to do next.
+      # =======================================================================
+      # Everything an operator needs after a successful deploy, on one page, so
+      # they never have to reconstruct it from the log.
+      - name: Write the run summary and the next steps
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          revision="$(helm status "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" \
+            --output json | jq -r '.version')"
+
+          # The auth Deployment's real name, for the `tctl` command below --
+          # found by label, like everywhere else.
+          selector="app.kubernetes.io/name=${CHART_NAME_LABEL}"
+          selector="${selector},app.kubernetes.io/instance=${HELM_RELEASE}"
+          selector="${selector},app.kubernetes.io/component=auth"
+          auth_deploy="$(kubectl get deployment -n "${K8S_NAMESPACE}" -l "${selector}" \
+            -o jsonpath='{.items[0].metadata.name}')"
+
+          # The record to create depends on whether the target is an IP (A
+          # record) or a hostname (CNAME).
+          if [[ "${DNS_TARGET:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            record_type="A"
+          else
+            record_type="CNAME"
+          fi
+
+          {
+            echo "## Teleport cluster deployed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Cluster name | \`${TELEPORT_CLUSTER_NAME}\` |"
+            echo "| Teleport version | \`${TELEPORT_VERSION}\` |"
+            echo "| Namespace | \`${K8S_NAMESPACE}\` |"
+            echo "| Helm release | \`${HELM_RELEASE}\` (revision ${revision}) |"
+            echo "| Service type | \`${SERVICE_TYPE}\` |"
+            echo "| Address to point DNS at | \`${DNS_TARGET:-not available}\` |"
+            echo "| Port clients use | \`${NODE_PORT:-443}\` |"
+            echo "| Certificate expires | ${CERT_NOT_AFTER:-unknown} |"
+            echo ""
+
+            if [[ "${SERVICE_TYPE}" == "ClusterIP" ]]; then
+              echo "### No DNS record to create"
+              echo ""
+              echo "\`${SERVICE_TYPE}\` is reachable only from inside the cluster, so there is"
+              echo "nothing useful to point DNS at. Put an Ingress in front of it, or use"
+              echo "\`kubectl port-forward\` for a look around."
+            else
+              echo "### 1. Create this DNS record"
+              echo ""
+              echo '```'
+              echo "${TELEPORT_CLUSTER_NAME}.  ${record_type}  ${DNS_TARGET:-<address not available>}"
+              echo '```'
+              echo ""
+              if [[ -n "${NODE_PORT:-}" ]]; then
+                echo "Because this is a NodePort Service, clients must also use port"
+                echo "\`${NODE_PORT}\`: the web UI is at"
+                echo "\`https://${TELEPORT_CLUSTER_NAME}:${NODE_PORT}/\`. DNS records cannot carry"
+                echo "a port, which is why the PUBLIC_ADDR variable exists."
+                echo ""
+              fi
+            fi
+
+            echo "### 2. Create your first user"
+            echo ""
+            echo "A fresh Teleport cluster has no users at all. Run this against the auth pod:"
+            echo ""
+            echo '```bash'
+            echo "kubectl exec -n ${K8S_NAMESPACE} deploy/${auth_deploy} -- \\"
+            echo "  tctl users add <your-name> --roles=editor,access"
+            echo '```'
+            echo ""
+            echo "It prints a single-use invitation link. Open it to set a password and"
+            echo "enrol a second factor. The link expires, so use it promptly."
+            echo ""
+            echo "### 3. Day-two operations"
+            echo ""
+            echo "See \`docs/runbook.md\` for upgrades, certificate renewal (no redeploy"
+            echo "needed), and troubleshooting."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Also print the essentials to the log, for anyone reading it directly.
+          echo "Deployed ${TELEPORT_CLUSTER_NAME} (Teleport ${TELEPORT_VERSION}), Helm revision ${revision}."
+          echo "Point DNS at: ${DNS_TARGET:-not available} (${record_type} record)"
+          echo "First user:   kubectl exec -n ${K8S_NAMESPACE} deploy/${auth_deploy} -- tctl users add <name> --roles=editor,access"
+
+      # =======================================================================
+      # STEP 18 -- if anything above failed, collect evidence.
+      # =======================================================================
+      # `if: failure()` means "run this step only when an earlier step in this
+      # job failed". Without it, a step is skipped as soon as anything fails --
+      # which is usually what you want, but not for a diagnostics step.
+      #
+      # `|| true` after each command stops the *collection* from failing when
+      # part of it cannot run (there may be no release at all, for instance).
+      #
+      # The result is uploaded as an ARTIFACT: a file attached to the run,
+      # downloadable from the box at the bottom of the run's summary page. Far
+      # easier to read, search and share than scrolling the log.
+      - name: Collect diagnostics because something failed
+        if: failure()
+        run: |
+          set -uo pipefail
+          out="diagnostics.txt"
+
+          # Everything between `{` and `}` writes to diagnostics.txt through ONE
+          # redirect. Grouping like this is tidier than repeating `>> file` on
+          # forty lines, and it means stdout and stderr of every command inside
+          # land in the file together, in order.
+          {
+            echo "=============================================="
+            echo "Diagnostics for a failed Teleport deploy"
+            echo "  namespace : ${K8S_NAMESPACE}"
+            echo "  release   : ${HELM_RELEASE}"
+            echo "  collected : $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo "=============================================="
+
+            echo ""
+            echo "### Everything in the namespace ###"
+            kubectl get all,pvc,secrets -n "${K8S_NAMESPACE}" || true
+
+            echo ""
+            echo "### Recent events (usually the most useful section) ###"
+            kubectl get events -n "${K8S_NAMESPACE}" --sort-by=.lastTimestamp || true
+
+            echo ""
+            echo "### Pods that are not Running ###"
+            # `--field-selector` asks the API server to filter, so we only
+            # describe the interesting pods rather than all of them.
+            for phase in Pending Failed Unknown; do
+              for pod in $(kubectl get pods -n "${K8S_NAMESPACE}" \
+                  --field-selector "status.phase=${phase}" \
+                  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                echo "--- describe pod/${pod} (${phase}) ---"
+                kubectl describe "pod/${pod}" -n "${K8S_NAMESPACE}" || true
+              done
+            done
+
+            echo ""
+            echo "### Logs, last 100 lines per component ###"
+            for component in auth proxy; do
+              selector="app.kubernetes.io/name=${CHART_NAME_LABEL}"
+              selector="${selector},app.kubernetes.io/instance=${HELM_RELEASE}"
+              selector="${selector},app.kubernetes.io/component=${component}"
+              echo "--- ${component} (${selector}) ---"
+              kubectl logs -n "${K8S_NAMESPACE}" -l "${selector}" \
+                --tail=100 --all-containers --prefix || true
+              # A crash-looping pod's useful output is in the PREVIOUS container.
+              kubectl logs -n "${K8S_NAMESPACE}" -l "${selector}" \
+                --tail=100 --all-containers --prefix --previous || true
+            done
+
+            echo ""
+            echo "### Helm release state ###"
+            helm status "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" || true
+            helm history "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" || true
+          } > "${out}" 2>&1
+
+          echo ""
+          echo "Diagnostics collected. Printing them here as well as uploading them:"
+          echo ""
+          cat "${out}"
+
+          {
+            echo "## This run failed"
+            echo ""
+            echo "Scroll up in the job log to the first RED step -- later failures are"
+            echo "usually consequences of it. Full diagnostics are attached to this run as"
+            echo "the \`teleport-deploy-diagnostics\` artifact (download box at the bottom of"
+            echo "this page)."
+            echo ""
+            echo "\`docs/github-actions-101.md\` section 9 lists the common failures and what"
+            echo "each one looks like."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Uploading is a separate step because it uses an action rather than a
+      # shell command, and because it must still run even if the collection step
+      # above went wrong.
+      - name: Attach the diagnostics to this run as a downloadable file
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: teleport-deploy-diagnostics
+          path: |
+            diagnostics.txt
+            rendered-values.yaml
+            rendered-manifests.yaml
+          # Do not fail the upload just because an earlier step never got far
+          # enough to create one of those files.
+          if-no-files-found: ignore
+          retention-days: 14

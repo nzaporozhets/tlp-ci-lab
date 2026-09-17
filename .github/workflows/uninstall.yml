@@ -1,0 +1,294 @@
+# =============================================================================
+# Uninstall Teleport cluster
+# =============================================================================
+# Removes the Helm release that deploy.yml created.
+#
+# WHAT IT WILL NOT TOUCH, EVER:
+#   * the TLS secret        -- you created it, it is yours
+#   * the licence secret    -- likewise
+#   * the namespace         -- likewise
+#
+# The rule is simple and worth remembering: a pipeline should only delete things
+# it created. Those three came from your hands (docs/setup.md steps 1-3), so this
+# workflow leaves them alone and says so at the end.
+#
+# If you are new to GitHub Actions, read docs/github-actions-101.md. This file is
+# the shorter of the two real workflows and a good second one to read.
+# =============================================================================
+
+name: Uninstall Teleport cluster
+
+# -----------------------------------------------------------------------------
+# Button-only, like deploy.yml. Nothing automatic may ever delete a cluster.
+#
+# `inputs:` are the fields in the "Run workflow" dialog. `confirm` is deliberately
+# annoying: you have to type the cluster name.
+# -----------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the cluster name to confirm (e.g. teleport.example.com)'
+        required: true
+        type: string
+      delete_pvc:
+        description: 'Also delete the data volume (DESTROYS all cluster state)'
+        type: boolean
+        default: false
+
+# The SAME concurrency group as deploy.yml. That is the point: a deploy and an
+# uninstall can then never run at the same time against the same cluster.
+concurrency:
+  group: teleport-mvp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  uninstall:
+    runs-on: [self-hosted, linux, "${{ vars.RUNNER_LABEL }}"]
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      TELEPORT_CLUSTER_NAME: ${{ vars.TELEPORT_CLUSTER_NAME }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      TLS_SECRET_NAME: ${{ vars.TLS_SECRET_NAME }}
+      LICENSE_SECRET_NAME: ${{ vars.LICENSE_SECRET_NAME }}
+      HELM_RELEASE: teleport
+      CHART_NAME_LABEL: teleport-cluster
+      # The typed confirmation and the checkbox, passed through `env:` rather
+      # than pasted into the script text -- `confirm` is free-form text typed by a
+      # human, which is exactly the kind of value you never interpolate directly
+      # into a shell command.
+      CONFIRM: ${{ inputs.confirm }}
+      DELETE_PVC: ${{ inputs.delete_pvc }}
+
+    steps:
+      # =======================================================================
+      # STEP 1 -- the only thing standing between a mis-click and a dead cluster.
+      # =======================================================================
+      # There is no undo. Typing the cluster name is a deliberate speed bump: it
+      # forces you to look at which cluster this repository is configured for
+      # before you destroy it.
+      #
+      # The heavier-weight alternative, which this MVP deliberately does NOT
+      # implement, is a GitHub *Environment* with required reviewers: the run
+      # pauses and a named human must approve it in the UI. Worth adding if more
+      # than one person can press this button. See
+      # docs/github-actions-101.md section 10.
+      - name: Check you typed the cluster name correctly
+        run: |
+          set -euo pipefail
+          if [[ "${CONFIRM}" != "${TELEPORT_CLUSTER_NAME}" ]]; then
+            echo "You typed:  '${CONFIRM}'"
+            echo "Expected:   '${TELEPORT_CLUSTER_NAME}'  (the TELEPORT_CLUSTER_NAME repository variable)"
+            echo ""
+            echo "Nothing has been changed. Re-run and type the cluster name exactly."
+            echo "::error title=Confirmation did not match::Type '${TELEPORT_CLUSTER_NAME}' in the confirm field"
+            exit 1
+          fi
+          echo "Confirmed: uninstalling '${TELEPORT_CLUSTER_NAME}' from namespace '${K8S_NAMESPACE}'."
+          echo "Delete the data volume as well? ${DELETE_PVC}"
+
+      - name: Check out this repository onto the runner
+        # Not strictly needed -- this workflow reads no files from the repo -- but
+        # having the checkout present means diagnostics and any future step can
+        # refer to repository files without a surprise "no such file" error.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # =======================================================================
+      # STEP 2 -- same credential check as deploy.yml, same reason.
+      # =======================================================================
+      # This workflow handles no credentials either. If the runner cannot reach
+      # the cluster, say so plainly instead of failing inside Helm.
+      - name: Check the runner can reach the Kubernetes cluster
+        run: |
+          set -euo pipefail
+          if ! kubectl cluster-info; then
+            echo ""
+            echo "The runner's Kubernetes credentials are not working."
+            echo "This workflow does not manage them -- see docs/setup.md step 5."
+            echo "::error title=Cannot reach the Kubernetes cluster::The runner's credentials are not working -- see docs/setup.md step 5"
+            exit 1
+          fi
+
+      # =======================================================================
+      # STEP 3 -- show what exists right now.
+      # =======================================================================
+      # A record in the log of what was there before you deleted it. This has
+      # saved more than one person's afternoon.
+      - name: Show what is currently installed
+        run: |
+          set -euo pipefail
+          echo "### Helm releases in ${K8S_NAMESPACE} ###"
+          helm list -n "${K8S_NAMESPACE}" || true
+          echo ""
+          echo "### Everything in ${K8S_NAMESPACE} ###"
+          kubectl get all,pvc -n "${K8S_NAMESPACE}" || true
+
+      # =======================================================================
+      # STEP 4 -- protect the data volume, unless you asked to destroy it.
+      # =======================================================================
+      # An important and slightly surprising fact: the chart's
+      # PersistentVolumeClaim is an ordinary Helm-managed resource with no
+      # "keep" annotation, so `helm uninstall` DELETES IT along with everything
+      # else. You cannot ask Helm to spare it.
+      #
+      # What you CAN do is tell Kubernetes to keep the underlying volume when the
+      # claim goes away, by setting the PersistentVolume's reclaim policy to
+      # `Retain`. The disk and its contents then survive as a `Released` volume
+      # that an administrator can re-attach -- see docs/runbook.md, "Recover the
+      # data volume after an uninstall", for that procedure.
+      #
+      # This is best-effort: PersistentVolumes are cluster-scoped, and the
+      # runner's credentials may not be allowed to patch them. If so we warn
+      # loudly rather than refusing to continue, because you asked to uninstall.
+      - name: Protect the data volume from deletion
+        if: ${{ !inputs.delete_pvc }}
+        run: |
+          set -euo pipefail
+
+          selector="app.kubernetes.io/name=${CHART_NAME_LABEL}"
+          selector="${selector},app.kubernetes.io/instance=${HELM_RELEASE}"
+          selector="${selector},app.kubernetes.io/component=auth"
+
+          pvc="$(kubectl get pvc -n "${K8S_NAMESPACE}" -l "${selector}" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [[ -z "${pvc}" ]]; then
+            echo "No Teleport PersistentVolumeClaim found -- nothing to protect."
+            exit 0
+          fi
+
+          volume="$(kubectl get pvc "${pvc}" -n "${K8S_NAMESPACE}" \
+            -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+          if [[ -z "${volume}" ]]; then
+            echo "::warning title=Data volume not bound::PVC '${pvc}' has no bound PersistentVolume, so there is no volume to retain."
+            exit 0
+          fi
+
+          echo "PVC '${pvc}' is bound to PersistentVolume '${volume}'."
+          if kubectl patch "persistentvolume/${volume}" \
+               -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'; then
+            echo ""
+            echo "Reclaim policy set to Retain. When helm uninstall deletes the claim, the"
+            echo "volume '${volume}' and everything on it will survive as 'Released'."
+            echo "Write that name down: ${volume}"
+            echo "Recovery instructions are in docs/runbook.md."
+            echo "PROTECTED_VOLUME=${volume}" >> "$GITHUB_ENV"
+          else
+            echo "::warning title=Could not retain the data volume::Patching persistentvolume/${volume} failed (PersistentVolumes are cluster-scoped and the runner may not be allowed to patch them). helm uninstall will delete the claim, and with the default reclaim policy the data will be deleted too."
+          fi
+
+      # =======================================================================
+      # STEP 5 -- remove the Helm release.
+      # =======================================================================
+      # `--ignore-not-found` is what makes this workflow re-runnable: running it
+      # twice is a no-op the second time instead of an error. Same idea as
+      # `helm upgrade --install` in deploy.yml -- commands that do not mind being
+      # repeated are much easier to build a pipeline out of.
+      #
+      # `--wait` makes Helm block until the resources are actually gone, so the
+      # report in the last step describes reality.
+      - name: Uninstall the Teleport Helm release
+        run: |
+          set -euo pipefail
+          helm uninstall "${HELM_RELEASE}" \
+            --namespace "${K8S_NAMESPACE}" \
+            --ignore-not-found \
+            --wait --timeout 10m
+          echo "Helm release '${HELM_RELEASE}' is gone (or was never there)."
+
+      # =======================================================================
+      # STEP 6 -- delete the data volume, if that is what you asked for.
+      # =======================================================================
+      # READ THE WARNING BELOW. This volume holds Teleport's certificate
+      # authorities and every locally-created user. Delete it and:
+      #   * every user must be created again from scratch,
+      #   * every enrolled second factor is void,
+      #   * every joined resource must re-join, because the CA that signed its
+      #     identity no longer exists.
+      # There is no recovery without a backup you took yourself.
+      #
+      # In practice `helm uninstall` above has usually already removed the claim
+      # (see step 4). This step is the belt-and-braces sweep, and it is also what
+      # ensures the underlying volume is really released.
+      - name: Delete the data volume, destroying all cluster state
+        if: ${{ inputs.delete_pvc }}
+        run: |
+          set -euo pipefail
+
+          echo "::warning title=Destroying all Teleport cluster state::You asked to delete the data volume. Teleport's certificate authorities and all local users are in there. Nothing can be recovered without your own backup."
+
+          selector="app.kubernetes.io/name=${CHART_NAME_LABEL}"
+          selector="${selector},app.kubernetes.io/instance=${HELM_RELEASE}"
+          selector="${selector},app.kubernetes.io/component=auth"
+
+          # Both routes, because helm uninstall may already have taken the claim
+          # away: by label first, and by the release name (which is also the
+          # claim's name) as a fallback.
+          kubectl delete pvc -n "${K8S_NAMESPACE}" -l "${selector}" --ignore-not-found
+          kubectl delete "pvc/${HELM_RELEASE}" -n "${K8S_NAMESPACE}" --ignore-not-found
+
+          echo "Data volume deleted (or already gone)."
+
+      # =======================================================================
+      # STEP 7 -- say plainly what was left behind.
+      # =======================================================================
+      # `if: always()` runs this step whether or not the ones above succeeded,
+      # because "what state is my cluster in now?" is the question you have
+      # either way. It is the counterpart to `if: failure()` in deploy.yml.
+      - name: Report what was removed and what was deliberately left alone
+        if: always()
+        run: |
+          set -uo pipefail
+
+          echo "### What is left in ${K8S_NAMESPACE} ###"
+          kubectl get all,pvc -n "${K8S_NAMESPACE}" 2>&1 || true
+          echo ""
+          echo "### Secrets left in place (key names only, never values) ###"
+          kubectl get secrets -n "${K8S_NAMESPACE}" 2>&1 || true
+
+          {
+            echo "## Uninstall finished"
+            echo ""
+            echo "Removed:"
+            echo ""
+            echo "* Helm release \`${HELM_RELEASE}\` from namespace \`${K8S_NAMESPACE}\`"
+            if [[ "${DELETE_PVC}" == "true" ]]; then
+              echo "* the data volume, and with it Teleport's certificate authorities and all"
+              echo "  local users. This cannot be undone."
+            elif [[ -n "${PROTECTED_VOLUME:-}" ]]; then
+              echo "* the data *claim* (\`helm uninstall\` always removes it), but the"
+              echo "  underlying volume \`${PROTECTED_VOLUME}\` was set to \`Retain\` first, so"
+              echo "  the data survives as a \`Released\` PersistentVolume. See"
+              echo "  \`docs/runbook.md\` to re-attach it."
+            fi
+            echo ""
+            echo "### Deliberately left in place"
+            echo ""
+            echo "This workflow did not create these, so it does not delete them:"
+            echo ""
+            echo "* the TLS secret \`${TLS_SECRET_NAME}\`"
+            echo "* the licence secret \`${LICENSE_SECRET_NAME}\`"
+            echo "* the namespace \`${K8S_NAMESPACE}\` itself"
+            echo ""
+            echo "That means re-running **Deploy Teleport cluster** brings the cluster straight"
+            echo "back up with no manual preparation. If you really want them gone, delete"
+            echo "them by hand:"
+            echo ""
+            echo '```bash'
+            echo "kubectl delete namespace ${K8S_NAMESPACE}   # takes the secrets with it"
+            echo '```'
+            echo ""
+            echo "Your DNS record still points at an address that no longer answers. Remove it"
+            echo "yourself if the cluster is not coming back -- this project never touches DNS."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo ""
+          echo "LEFT IN PLACE ON PURPOSE: secret/${TLS_SECRET_NAME}, secret/${LICENSE_SECRET_NAME}, namespace/${K8S_NAMESPACE}."
+          echo "This workflow did not create them, so it does not delete them."
