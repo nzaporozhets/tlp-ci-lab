@@ -1,0 +1,737 @@
+name: deploy
+
+# SECURITY (SPEC.md §10.1): this workflow runs on a self-hosted runner with an IAM
+# instance profile and access to a kubeconfig. It must NEVER be triggered by
+# `pull_request` or `pull_request_target`, because that would execute code from an
+# untrusted fork on that runner. Triggers are workflow_dispatch and push to main
+# only; branch protection with a required review on `main` is the control that
+# makes the push trigger safe. lint.yml enforces this rule mechanically.
+on:
+  workflow_dispatch:
+    inputs:
+      skip_ec2_agent:
+        description: Skip the Terraform-provisioned EC2 SSH agent
+        type: boolean
+        default: false
+      skip_kube_agent:
+        description: Skip the in-cluster Kubernetes agent
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'helm/**'
+      - 'terraform/ec2-agent/**'
+      - 'teleport/**'
+      - 'scripts/**'
+      - '.github/workflows/deploy.yml'
+
+concurrency:
+  # Shared with destroy.yml so the two can never interleave.
+  group: teleport-ci-env
+  # Never cancel a half-applied deploy.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Repository variables promoted into env so that scripts and the envsubst
+  # templates can read them without ${{ }} interpolation inside run: bodies.
+  TELEPORT_VERSION: ${{ vars.TELEPORT_VERSION }}
+  TELEPORT_CLUSTER_NAME: ${{ vars.TELEPORT_CLUSTER_NAME }}
+  ACME_EMAIL: ${{ vars.ACME_EMAIL }}
+  ACME_USE_STAGING: ${{ vars.ACME_USE_STAGING }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+  ROUTE53_ZONE_ID: ${{ vars.ROUTE53_ZONE_ID }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  EC2_AGENT_INSTANCE_TYPE: ${{ vars.EC2_AGENT_INSTANCE_TYPE }}
+  EC2_AGENT_SUBNET_ID: ${{ vars.EC2_AGENT_SUBNET_ID }}
+  EC2_AGENT_VPC_ID: ${{ vars.EC2_AGENT_VPC_ID }}
+  K8S_NAMESPACE_CLUSTER: ${{ vars.K8S_NAMESPACE_CLUSTER }}
+  K8S_NAMESPACE_AGENT: ${{ vars.K8S_NAMESPACE_AGENT }}
+  KUBE_CLUSTER_NAME: ${{ vars.KUBE_CLUSTER_NAME }}
+  # Not a repo variable: the agent role name and IAM path are a repo-internal
+  # convention shared between teleport/tokens/ec2-agent-token.yaml and
+  # terraform/ec2-agent. The path must match agent_iam_path in
+  # terraform/runner-bootstrap, which is what scopes the runner's iam:* grant.
+  EC2_AGENT_ROLE_NAME: teleport-ci-ec2-agent
+  EC2_AGENT_IAM_PATH: /teleport-ci/
+  HELM_REPO_URL: https://charts.releases.teleport.dev
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: preflight
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 5
+    outputs:
+      aws_account_id: ${{ steps.identity.outputs.aws_account_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: Check required configuration is present
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in TELEPORT_VERSION TELEPORT_CLUSTER_NAME ACME_EMAIL AWS_REGION \
+                   ROUTE53_ZONE_ID TF_STATE_BUCKET EC2_AGENT_INSTANCE_TYPE \
+                   EC2_AGENT_SUBNET_ID EC2_AGENT_VPC_ID K8S_NAMESPACE_CLUSTER \
+                   K8S_NAMESPACE_AGENT KUBE_CLUSTER_NAME; do
+            [ -n "${!v:-}" ] || missing+=("$v")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=preflight::missing repository variables: ${missing[*]} (see SPEC.md §5.1)"
+            exit 1
+          fi
+          if [ -z "${ACME_USE_STAGING:-}" ]; then
+            echo "::notice title=preflight::ACME_USE_STAGING is unset; treating it as false (Let's Encrypt production)"
+          fi
+          echo "configuration looks complete"
+
+      - name: AWS identity (proves the instance profile works)
+        id: identity
+        run: |
+          set -euo pipefail
+          if ! caller="$(aws sts get-caller-identity --output json)"; then
+            echo "::error title=preflight::aws sts get-caller-identity failed. The runner has no working IAM instance profile (SPEC.md §7.2)."
+            exit 1
+          fi
+          account="$(jq -r '.Account' <<<"$caller")"
+          arn="$(jq -r '.Arn' <<<"$caller")"
+          echo "acting as: $arn"
+          echo "aws_account_id=$account" >>"$GITHUB_OUTPUT"
+
+      - name: Materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: ./scripts/kubeconfig.sh
+
+      - name: Kubernetes reachability and RBAC spot-checks
+        run: |
+          set -euo pipefail
+          if ! kubectl version -o json >/dev/null 2>&1; then
+            echo "::error title=preflight::cannot reach the Kubernetes API server with the supplied KUBECONFIG."
+            kubectl version --client -o yaml || true
+            exit 1
+          fi
+          kubectl version -o json | jq -r '"client " + .clientVersion.gitVersion + ", server " + .serverVersion.gitVersion'
+
+          problems=0
+          check() { # <namespace|-> <verb> <resource>
+            local ns="$1" verb="$2" res="$3" where="cluster scope"
+            local -a scope=()
+            if [ "$ns" != "-" ]; then
+              scope=(-n "$ns")
+              where="namespace $ns"
+            fi
+            if ! kubectl auth can-i "${scope[@]}" "$verb" "$res" >/dev/null 2>&1; then
+              echo "  DENIED: $verb $res ($where)"
+              problems=$((problems + 1))
+            fi
+          }
+
+          for ns in "$K8S_NAMESPACE_CLUSTER" "$K8S_NAMESPACE_AGENT"; do
+            echo "checking RBAC in namespace $ns"
+            for res in deployments statefulsets services configmaps secrets \
+                       serviceaccounts pods persistentvolumeclaims \
+                       roles.rbac.authorization.k8s.io rolebindings.rbac.authorization.k8s.io; do
+              for verb in create get delete; do
+                check "$ns" "$verb" "$res"
+              done
+            done
+            # pods/exec is how scripts/tctl.sh reaches the auth service.
+            check "$ns" create pods/exec
+            check "$ns" get pods/log
+          done
+
+          echo "checking cluster-scoped RBAC"
+          check - create namespaces
+          check - get namespaces
+          check - create clusterroles.rbac.authorization.k8s.io
+          check - create clusterrolebindings.rbac.authorization.k8s.io
+
+          if [ "$problems" -gt 0 ]; then
+            echo "::error title=preflight::$problems permission(s) are missing from the CI ServiceAccount. See SPEC.md §8.2 for the exact list; note that creating ClusterRoleBindings also needs the SA to hold those permissions itself, or 'escalate'/'bind' on them."
+            exit 1
+          fi
+          echo "RBAC spot-checks passed"
+
+      - name: Assert TELEPORT_CLUSTER_NAME lives in ROUTE53_ZONE_ID
+        run: |
+          set -euo pipefail
+          zone_json="$(aws route53 get-hosted-zone --id "$ROUTE53_ZONE_ID" --output json)"
+          zone_name="$(jq -r '.HostedZone.Name' <<<"$zone_json")"
+          zone_name="${zone_name%.}"
+          private="$(jq -r '.HostedZone.Config.PrivateZone // false' <<<"$zone_json")"
+          echo "zone $ROUTE53_ZONE_ID is '$zone_name' (private: $private)"
+
+          if [ "$private" = "true" ]; then
+            echo "::error title=preflight::hosted zone $ROUTE53_ZONE_ID is a private zone. Let's Encrypt must be able to resolve $TELEPORT_CLUSTER_NAME from the public internet."
+            exit 1
+          fi
+
+          if [ "$TELEPORT_CLUSTER_NAME" != "$zone_name" ] && \
+             [ "${TELEPORT_CLUSTER_NAME%".$zone_name"}" = "$TELEPORT_CLUSTER_NAME" ]; then
+            echo "::error title=preflight::TELEPORT_CLUSTER_NAME='$TELEPORT_CLUSTER_NAME' is not inside hosted zone '$zone_name'. Left unchecked this surfaces as an unexplained ACME timeout 15 minutes later."
+            exit 1
+          fi
+          echo "$TELEPORT_CLUSTER_NAME is inside $zone_name"
+
+      - name: Assert Terraform state bucket exists with versioning enabled
+        run: |
+          set -euo pipefail
+          if ! versioning="$(aws s3api get-bucket-versioning --bucket "$TF_STATE_BUCKET" --output json 2>&1)"; then
+            echo "$versioning"
+            echo "::error title=preflight::cannot inspect s3://$TF_STATE_BUCKET. Either it does not exist, or the runner role lacks s3:GetBucketVersioning on it (SPEC.md §8.1)."
+            exit 1
+          fi
+          status="$(jq -r '.Status // "Disabled"' <<<"$versioning")"
+          echo "s3://$TF_STATE_BUCKET versioning: $status"
+          if [ "$status" != "Enabled" ]; then
+            echo "::error title=preflight::versioning is not enabled on s3://$TF_STATE_BUCKET. Terraform state corruption would be unrecoverable."
+            exit 1
+          fi
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          echo "----- runner tooling -----"
+          for t in kubectl helm terraform aws jq envsubst; do
+            printf '%s: %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+          echo "----- aws identity -----"
+          aws sts get-caller-identity
+          echo "----- what the CI ServiceAccount may do -----"
+          kubectl auth can-i --list -n "$K8S_NAMESPACE_CLUSTER" | head -n 60
+          echo "----- existing state -----"
+          helm list -A
+          kubectl get ns
+
+      - name: Remove secret material from the runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig"
+          echo "cleaned $RUNNER_TEMP"
+
+  # ---------------------------------------------------------------------------
+  cluster:
+    name: teleport-cluster
+    needs: [preflight]
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 25
+    outputs:
+      proxy_addr: ${{ steps.proxy.outputs.proxy_addr }}
+      lb_address: ${{ steps.lb.outputs.lb_address }}
+      acme_issuer: ${{ steps.acme.outputs.acme_issuer }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: Materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: ./scripts/kubeconfig.sh
+
+      - name: Add the Teleport Helm repository
+        run: |
+          set -euo pipefail
+          helm repo add teleport "$HELM_REPO_URL"
+          helm repo update teleport
+          helm search repo "teleport/teleport-cluster" --version "$TELEPORT_VERSION" |
+            grep -q "$TELEPORT_VERSION" || {
+              echo "::error title=cluster::chart teleport/teleport-cluster version $TELEPORT_VERSION not found in $HELM_REPO_URL"
+              exit 1
+            }
+
+      - name: Ensure the namespace exists
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$K8S_NAMESPACE_CLUSTER" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create or update the Enterprise license secret
+        env:
+          TELEPORT_ENTERPRISE_LICENSE: ${{ secrets.TELEPORT_ENTERPRISE_LICENSE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TELEPORT_ENTERPRISE_LICENSE:-}" ]; then
+            echo "::error title=cluster::the TELEPORT_ENTERPRISE_LICENSE secret is empty (SPEC.md §5.2)"
+            exit 1
+          fi
+          # 0600 before any content is written; never echoed, never a CLI argument.
+          umask 077
+          rm -f "$RUNNER_TEMP/license.pem"
+          : >"$RUNNER_TEMP/license.pem"
+          chmod 600 "$RUNNER_TEMP/license.pem"
+          printf '%s' "$TELEPORT_ENTERPRISE_LICENSE" >"$RUNNER_TEMP/license.pem"
+
+          if ! grep -q -- '-----BEGIN' "$RUNNER_TEMP/license.pem"; then
+            echo "::error title=cluster::the license secret does not look like a PEM file"
+            exit 1
+          fi
+
+          # The key inside the Secret MUST be license.pem -- that is the filename
+          # the chart mounts and Teleport reads.
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" create secret generic license \
+            --from-file=license.pem="$RUNNER_TEMP/license.pem" \
+            --dry-run=client -o yaml |
+            kubectl apply -f - >/dev/null
+          echo "license secret applied to namespace $K8S_NAMESPACE_CLUSTER"
+
+      - name: Render Helm values
+        run: |
+          set -euo pipefail
+          if [ "${ACME_USE_STAGING:-false}" = "true" ]; then
+            ACME_URI="https://acme-staging-v02.api.letsencrypt.org/directory"
+            echo "::warning title=cluster::ACME_USE_STAGING=true -- issuing from the Let's Encrypt STAGING CA. The certificate will NOT be publicly trusted, so the teleport-kube-agent will fail to join. Use this only while iterating on the pipeline (SPEC.md §9.3)."
+          else
+            ACME_URI=""
+          fi
+          export ACME_URI
+          # envsubst takes its variable list as literal $NAME tokens.
+          # shellcheck disable=SC2016
+          envsubst '$TELEPORT_CLUSTER_NAME $ACME_EMAIL $ACME_URI' \
+            <helm/teleport-cluster.values.yaml >"$RUNNER_TEMP/cluster-values.yaml"
+          echo "--- rendered values (contains no secrets) ---"
+          cat "$RUNNER_TEMP/cluster-values.yaml"
+
+      - name: helm upgrade --install teleport-cluster
+        run: |
+          set -euo pipefail
+          helm upgrade --install teleport-cluster teleport/teleport-cluster \
+            --version "$TELEPORT_VERSION" \
+            -n "$K8S_NAMESPACE_CLUSTER" \
+            -f "$RUNNER_TEMP/cluster-values.yaml" \
+            --wait --timeout 10m
+          helm status teleport-cluster -n "$K8S_NAMESPACE_CLUSTER"
+
+      # At this point the proxy is up but serving a self-signed certificate: ACME
+      # cannot complete until DNS resolves to the load balancer, and the load
+      # balancer address only exists now. See the ordering note in SPEC.md §6.1.
+      - name: Wait for the Service load balancer address
+        id: lb
+        run: |
+          set -euo pipefail
+          svc="$(kubectl -n "$K8S_NAMESPACE_CLUSTER" get svc \
+            -l 'app.kubernetes.io/name=teleport-cluster,app.kubernetes.io/component=proxy' \
+            -o json | jq -r '.items[] | select(.spec.type == "LoadBalancer") | .metadata.name' | head -n1)"
+          if [ -z "$svc" ]; then
+            echo "::error title=cluster::no LoadBalancer Service found for the teleport-cluster proxy"
+            kubectl -n "$K8S_NAMESPACE_CLUSTER" get svc --show-labels
+            exit 1
+          fi
+          echo "proxy service: $svc"
+
+          addr=""
+          for attempt in $(seq 1 60); do
+            # Handle BOTH shapes: cloud LBs report .hostname, MetalLB and most
+            # bare-metal implementations report .ip.
+            addr="$(kubectl -n "$K8S_NAMESPACE_CLUSTER" get svc "$svc" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+            if [ -z "$addr" ]; then
+              addr="$(kubectl -n "$K8S_NAMESPACE_CLUSTER" get svc "$svc" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+            fi
+            if [ -n "$addr" ]; then
+              echo "load balancer address after ${attempt} attempt(s): $addr"
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$addr" ]; then
+            echo "::error title=cluster::the Service never received an external address (5 min). Does this cluster have a LoadBalancer controller?"
+            kubectl -n "$K8S_NAMESPACE_CLUSTER" describe svc "$svc"
+            exit 1
+          fi
+          echo "lb_address=$addr" >>"$GITHUB_OUTPUT"
+
+      - name: Point DNS at the load balancer
+        run: ./scripts/route53-upsert.sh "${{ steps.lb.outputs.lb_address }}"
+
+      - name: Wait for ACME to issue a certificate
+        id: acme
+        run: ./scripts/wait-for-acme.sh
+
+      - name: Publish the proxy address
+        id: proxy
+        run: echo "proxy_addr=${TELEPORT_CLUSTER_NAME}:443" >>"$GITHUB_OUTPUT"
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          out="$RUNNER_TEMP/diagnostics-cluster"
+          mkdir -p "$out"
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get all,pvc,events -o wide >"$out/resources.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get events --sort-by=.lastTimestamp >"$out/events.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" logs -l 'app.kubernetes.io/component=auth' -c teleport --tail=200 >"$out/auth.log" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" logs -l 'app.kubernetes.io/component=proxy' -c teleport --tail=200 >"$out/proxy.log" 2>&1
+          for pod in $(kubectl -n "$K8S_NAMESPACE_CLUSTER" get pods \
+                -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\n"}{end}'); do
+            kubectl -n "$K8S_NAMESPACE_CLUSTER" describe pod "$pod" >>"$out/not-ready-pods.txt" 2>&1
+          done
+          helm status teleport-cluster -n "$K8S_NAMESPACE_CLUSTER" >"$out/helm-status.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get pvc -o yaml >"$out/pvc.yaml" 2>&1
+          echo "collected $(find "$out" -type f | wc -l) file(s)"
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-cluster-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostics-cluster
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove secret material from the runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig" "$RUNNER_TEMP/license.pem" "$RUNNER_TEMP/cluster-values.yaml"
+          rm -rf "$RUNNER_TEMP/diagnostics-cluster"
+          echo "cleaned $RUNNER_TEMP"
+
+  # ---------------------------------------------------------------------------
+  tokens:
+    name: provision-tokens
+    needs: [preflight, cluster]
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: Materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: ./scripts/kubeconfig.sh
+
+      # Both tokens use delegated join methods, so neither file contains a secret
+      # and both can safely be printed for auditability (SPEC.md §3.1).
+      - name: Apply provision tokens
+        env:
+          AWS_ACCOUNT_ID: ${{ needs.preflight.outputs.aws_account_id }}
+        run: |
+          set -euo pipefail
+          # envsubst takes its variable list as literal $NAME tokens.
+          # shellcheck disable=SC2016
+          envsubst '$K8S_NAMESPACE_AGENT' \
+            <teleport/tokens/kube-agent-token.yaml >"$RUNNER_TEMP/kube-agent-token.yaml"
+          # envsubst takes its variable list as literal $NAME tokens.
+          # shellcheck disable=SC2016
+          envsubst '$AWS_ACCOUNT_ID $EC2_AGENT_ROLE_NAME' \
+            <teleport/tokens/ec2-agent-token.yaml >"$RUNNER_TEMP/ec2-agent-token.yaml"
+
+          for f in "$RUNNER_TEMP/kube-agent-token.yaml" "$RUNNER_TEMP/ec2-agent-token.yaml"; do
+            echo "--- $(basename "$f") ---"
+            cat "$f"
+            # tctl create -f is an upsert, so this is idempotent (SPEC.md §9.2).
+            ./scripts/tctl.sh apply-file "$f"
+          done
+
+      - name: Confirm both tokens exist
+        run: |
+          set -euo pipefail
+          for name in kube-agent-token ec2-agent-token; do
+            if ! ./scripts/tctl.sh get "token/$name" --format=json >/dev/null; then
+              echo "::error title=tokens::provision token '$name' is not present after apply"
+              exit 1
+            fi
+            echo "token/$name present"
+          done
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get pods -o wide
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" logs -l 'app.kubernetes.io/component=auth' -c teleport --tail=200
+          ./scripts/tctl.sh get tokens --format=text
+
+      - name: Remove secret material from the runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig" \
+                "$RUNNER_TEMP/kube-agent-token.yaml" \
+                "$RUNNER_TEMP/ec2-agent-token.yaml"
+          echo "cleaned $RUNNER_TEMP"
+
+  # ---------------------------------------------------------------------------
+  kube-agent:
+    name: teleport-kube-agent
+    needs: [cluster, tokens]
+    if: inputs.skip_kube_agent != true
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: Materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: ./scripts/kubeconfig.sh
+
+      - name: Add the Teleport Helm repository
+        run: |
+          set -euo pipefail
+          helm repo add teleport "$HELM_REPO_URL"
+          helm repo update teleport
+
+      - name: Render Helm values
+        run: |
+          set -euo pipefail
+          # envsubst takes its variable list as literal $NAME tokens.
+          # shellcheck disable=SC2016
+          envsubst '$TELEPORT_CLUSTER_NAME $KUBE_CLUSTER_NAME' \
+            <helm/teleport-kube-agent.values.yaml >"$RUNNER_TEMP/agent-values.yaml"
+          echo "--- rendered values (contains no secrets) ---"
+          cat "$RUNNER_TEMP/agent-values.yaml"
+
+          # insecureSkipProxyTLSVerify must stay false: if the agent cannot verify
+          # the proxy certificate then ACME did not complete, and failing is the
+          # correct outcome (SPEC.md §6.1).
+          if grep -Eq '^[[:space:]]*insecureSkipProxyTLSVerify:[[:space:]]*true' "$RUNNER_TEMP/agent-values.yaml"; then
+            echo "::error title=kube-agent::insecureSkipProxyTLSVerify is true. Refusing to deploy an agent that does not verify the proxy."
+            exit 1
+          fi
+
+      - name: Assert the rendered ServiceAccount matches the provision token
+        run: |
+          set -euo pipefail
+          rendered="$(helm template teleport-kube-agent teleport/teleport-kube-agent \
+            --version "$TELEPORT_VERSION" \
+            -n "$K8S_NAMESPACE_AGENT" \
+            -f "$RUNNER_TEMP/agent-values.yaml" \
+            --show-only templates/serviceaccount.yaml)"
+          sa_name="$(awk '/^kind: ServiceAccount$/{k=1} k && /^  name:/{print $2; exit}' <<<"$rendered")"
+          # "<namespace>:<serviceaccount>" -> take the part after the last colon.
+          expected="$(grep -o 'service_account:[[:space:]]*"[^"]*"' teleport/tokens/kube-agent-token.yaml |
+            head -n1 | sed 's/.*"\(.*\)"/\1/' | awk -F: '{print $NF}')"
+          echo "chart ServiceAccount: '$sa_name'; token allows: '$expected'"
+          if [ -z "$sa_name" ] || [ "$sa_name" != "$expected" ]; then
+            echo "::error title=kube-agent::ServiceAccount mismatch. The chart renders '$sa_name' but kube-agent-token.yaml allows '$expected'. The agent would be rejected at join time."
+            exit 1
+          fi
+
+      - name: helm upgrade --install teleport-kube-agent
+        run: |
+          set -euo pipefail
+          helm upgrade --install teleport-kube-agent teleport/teleport-kube-agent \
+            --version "$TELEPORT_VERSION" \
+            -n "$K8S_NAMESPACE_AGENT" --create-namespace \
+            -f "$RUNNER_TEMP/agent-values.yaml" \
+            --wait --timeout 5m
+          helm status teleport-kube-agent -n "$K8S_NAMESPACE_AGENT"
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          out="$RUNNER_TEMP/diagnostics-kube-agent"
+          mkdir -p "$out"
+          kubectl -n "$K8S_NAMESPACE_AGENT" get all,pvc,events -o wide >"$out/resources.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_AGENT" get events --sort-by=.lastTimestamp >"$out/events.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_AGENT" logs -l 'app.kubernetes.io/name=teleport-kube-agent' -c teleport --tail=200 >"$out/agent.log" 2>&1
+          for pod in $(kubectl -n "$K8S_NAMESPACE_AGENT" get pods \
+                -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\n"}{end}'); do
+            kubectl -n "$K8S_NAMESPACE_AGENT" describe pod "$pod" >>"$out/not-ready-pods.txt" 2>&1
+          done
+          helm status teleport-kube-agent -n "$K8S_NAMESPACE_AGENT" >"$out/helm-status.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" logs -l 'app.kubernetes.io/component=auth' -c teleport --tail=200 >"$out/auth.log" 2>&1
+          echo "collected $(find "$out" -type f | wc -l) file(s)"
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-kube-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostics-kube-agent
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove secret material from the runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig" "$RUNNER_TEMP/agent-values.yaml"
+          rm -rf "$RUNNER_TEMP/diagnostics-kube-agent"
+          echo "cleaned $RUNNER_TEMP"
+
+  # ---------------------------------------------------------------------------
+  ec2-agent:
+    name: ec2-agent
+    needs: [cluster, tokens]
+    if: inputs.skip_ec2_agent != true
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 20
+    outputs:
+      instance_id: ${{ steps.apply.outputs.instance_id }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: terraform/ec2-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: terraform init
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set -euo pipefail
+          # -detailed-exitcode: 0 = no changes, 2 = changes present, 1 = error.
+          set +e
+          terraform plan -input=false -lock-timeout=5m -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "no changes"; echo "changes=false" >>"$GITHUB_OUTPUT" ;;
+            2) echo "changes planned"; echo "changes=true" >>"$GITHUB_OUTPUT" ;;
+            *) echo "::error title=ec2-agent::terraform plan failed"; exit 1 ;;
+          esac
+          terraform show -no-color tfplan >tfplan.txt
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_teleport_version: ${{ env.TELEPORT_VERSION }}
+          TF_VAR_proxy_addr: ${{ needs.cluster.outputs.proxy_addr }}
+          TF_VAR_instance_type: ${{ env.EC2_AGENT_INSTANCE_TYPE }}
+          TF_VAR_subnet_id: ${{ env.EC2_AGENT_SUBNET_ID }}
+          TF_VAR_vpc_id: ${{ env.EC2_AGENT_VPC_ID }}
+          TF_VAR_role_name: ${{ env.EC2_AGENT_ROLE_NAME }}
+          TF_VAR_iam_path: ${{ env.EC2_AGENT_IAM_PATH }}
+          TF_VAR_github_run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tfplan-ec2-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            terraform/ec2-agent/tfplan
+            terraform/ec2-agent/tfplan.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: terraform apply
+        id: apply
+        run: |
+          set -euo pipefail
+          terraform apply -input=false -lock-timeout=5m tfplan
+          instance_id="$(terraform output -raw instance_id)"
+          echo "instance_id=$instance_id" >>"$GITHUB_OUTPUT"
+          {
+            echo "### EC2 agent"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Instance | \`$instance_id\` |"
+            echo "| Role | \`$(terraform output -raw role_arn)\` |"
+            echo "| Expected join ARN | \`$(terraform output -raw expected_join_arn)\` |"
+          } >>"$GITHUB_STEP_SUMMARY"
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_teleport_version: ${{ env.TELEPORT_VERSION }}
+          TF_VAR_proxy_addr: ${{ needs.cluster.outputs.proxy_addr }}
+          TF_VAR_instance_type: ${{ env.EC2_AGENT_INSTANCE_TYPE }}
+          TF_VAR_subnet_id: ${{ env.EC2_AGENT_SUBNET_ID }}
+          TF_VAR_vpc_id: ${{ env.EC2_AGENT_VPC_ID }}
+          TF_VAR_role_name: ${{ env.EC2_AGENT_ROLE_NAME }}
+          TF_VAR_iam_path: ${{ env.EC2_AGENT_IAM_PATH }}
+          TF_VAR_github_run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          out="$RUNNER_TEMP/diagnostics-ec2-agent"
+          mkdir -p "$out"
+          terraform show -no-color >"$out/terraform-show.txt" 2>&1
+          cp tfplan.txt "$out/tfplan.txt" 2>/dev/null
+          instance_id="$(terraform output -raw instance_id 2>/dev/null)"
+          if [ -n "$instance_id" ]; then
+            echo "instance: $instance_id" >"$out/instance.txt"
+            aws ec2 describe-instances --instance-ids "$instance_id" \
+              --output json >"$out/describe-instances.json" 2>&1
+            # cloud-init writes user-data output to the serial console, so this
+            # works without any SSM permissions on the agent role
+            # (terraform/ec2-agent var attach_ssm_policy is off by default).
+            aws ec2 get-console-output --instance-id "$instance_id" --latest \
+              --output text >"$out/console-output.txt" 2>&1
+            # Best effort: only works if the agent role was given SSM access
+            # out of band. See docs/bootstrap.md.
+            aws ssm send-command --instance-ids "$instance_id" \
+              --document-name AWS-RunShellScript \
+              --parameters 'commands=["cat /var/lib/teleport-bootstrap/complete","tail -n 200 /var/log/cloud-init-output.log","journalctl -u teleport --no-pager -n 200"]' \
+              --output json >"$out/ssm-send-command.json" 2>&1 ||
+              echo "aws ssm send-command failed (expected: the agent role has no SSM permissions by default)" >>"$out/ssm-send-command.json"
+          fi
+          echo "collected $(find "$out" -type f | wc -l) file(s)"
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-ec2-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostics-ec2-agent
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Clean the runner workspace
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/diagnostics-ec2-agent"
+
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify
+    needs: [cluster, kube-agent, ec2-agent]
+    # Still run when an agent job was intentionally skipped, but not when the
+    # cluster itself failed -- there would be nothing to verify.
+    if: always() && needs.cluster.result == 'success'
+    uses: ./.github/workflows/verify.yml
+    with:
+      proxy_addr: ${{ needs.cluster.outputs.proxy_addr }}
+      check_kube_agent: ${{ needs.kube-agent.result == 'success' }}
+      check_ec2_agent: ${{ needs.ec2-agent.result == 'success' }}
+      ec2_instance_id: ${{ needs.ec2-agent.outputs.instance_id }}
+    secrets: inherit

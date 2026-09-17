@@ -1,0 +1,123 @@
+name: verify
+
+# Reusable workflow: asserts the cluster and both agents are healthy.
+#
+# SECURITY (SPEC.md §10.1): `workflow_call` only. This workflow runs on the
+# self-hosted runner and uses the teleport-ci environment, so it must never be
+# reachable from `pull_request` / `pull_request_target`, directly or via a caller.
+#
+# The job declares `environment: teleport-ci` itself, which is how the environment
+# secrets resolve -- a caller job that uses a reusable workflow cannot set
+# `environment:`, so `secrets: inherit` alone would not be enough.
+on:
+  workflow_call:
+    inputs:
+      proxy_addr:
+        description: 'Proxy address as host:port, from the cluster job.'
+        type: string
+        required: true
+      check_kube_agent:
+        description: 'Assert the Kubernetes agent has registered.'
+        type: boolean
+        required: false
+        default: true
+      check_ec2_agent:
+        description: 'Assert the EC2 SSH agent has registered.'
+        type: boolean
+        required: false
+        default: true
+      ec2_instance_id:
+        description: 'Instance ID the EC2 agent should have registered as.'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: assertions
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 10
+    env:
+      TELEPORT_VERSION: ${{ vars.TELEPORT_VERSION }}
+      TELEPORT_CLUSTER_NAME: ${{ vars.TELEPORT_CLUSTER_NAME }}
+      ACME_USE_STAGING: ${{ vars.ACME_USE_STAGING }}
+      K8S_NAMESPACE_CLUSTER: ${{ vars.K8S_NAMESPACE_CLUSTER }}
+      K8S_NAMESPACE_AGENT: ${{ vars.K8S_NAMESPACE_AGENT }}
+      KUBE_CLUSTER_NAME: ${{ vars.KUBE_CLUSTER_NAME }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      PROXY_ADDR: ${{ inputs.proxy_addr }}
+      CHECK_KUBE_AGENT: ${{ inputs.check_kube_agent }}
+      CHECK_EC2_AGENT: ${{ inputs.check_ec2_agent }}
+      EC2_INSTANCE_ID: ${{ inputs.ec2_instance_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: Materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: ./scripts/kubeconfig.sh
+
+      - name: Sanity-check the inputs agree with the repository variables
+        run: |
+          set -euo pipefail
+          expected="${TELEPORT_CLUSTER_NAME}:443"
+          if [ "$PROXY_ADDR" != "$expected" ]; then
+            echo "::error title=verify::the caller passed proxy_addr='$PROXY_ADDR' but TELEPORT_CLUSTER_NAME implies '$expected'"
+            exit 1
+          fi
+          if [ "$CHECK_EC2_AGENT" = "true" ] && [ -z "$EC2_INSTANCE_ID" ]; then
+            echo "::error title=verify::check_ec2_agent is true but ec2_instance_id is empty"
+            exit 1
+          fi
+
+      - name: Run assertions
+        run: ./scripts/verify.sh
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          out="$RUNNER_TEMP/diagnostics-verify"
+          mkdir -p "$out"
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get all,pvc,events -o wide >"$out/cluster-resources.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" logs -l 'app.kubernetes.io/component=auth' -c teleport --tail=200 >"$out/auth.log" 2>&1
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" logs -l 'app.kubernetes.io/component=proxy' -c teleport --tail=200 >"$out/proxy.log" 2>&1
+          kubectl -n "$K8S_NAMESPACE_AGENT" get all -o wide >"$out/agent-resources.txt" 2>&1
+          kubectl -n "$K8S_NAMESPACE_AGENT" logs -l 'app.kubernetes.io/name=teleport-kube-agent' -c teleport --tail=200 >"$out/kube-agent.log" 2>&1
+          ./scripts/tctl.sh status >"$out/tctl-status.txt" 2>&1
+          ./scripts/tctl.sh get nodes --format=json >"$out/nodes.json" 2>&1
+          ./scripts/tctl.sh get kube_servers --format=json >"$out/kube_servers.json" 2>&1
+          if [ -n "$EC2_INSTANCE_ID" ]; then
+            aws ec2 get-console-output --instance-id "$EC2_INSTANCE_ID" --latest \
+              --output text >"$out/ec2-console-output.txt" 2>&1
+          fi
+          echo "collected $(find "$out" -type f | wc -l) file(s)"
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-verify-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostics-verify
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove secret material from the runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig"
+          rm -rf "$RUNNER_TEMP/diagnostics-verify"
+          echo "cleaned $RUNNER_TEMP"

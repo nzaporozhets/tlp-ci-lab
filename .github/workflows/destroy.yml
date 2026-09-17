@@ -1,0 +1,229 @@
+name: destroy
+
+# SECURITY (SPEC.md §10.1): manual only. Never `pull_request` /
+# `pull_request_target` -- this workflow runs on the self-hosted runner and holds
+# the teleport-ci environment secrets. Put required reviewers on the teleport-ci
+# environment so a destroy cannot happen unattended.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the cluster name (TELEPORT_CLUSTER_NAME) to confirm destruction'
+        required: true
+        type: string
+      keep_cluster:
+        description: 'Destroy agents only, leave the Teleport cluster running'
+        type: boolean
+        default: false
+      delete_namespaces:
+        description: 'Also delete the two Kubernetes namespaces (only when keep_cluster is false)'
+        type: boolean
+        default: false
+
+concurrency:
+  # Shared with deploy.yml: a destroy can never interleave with a deploy.
+  group: teleport-ci-env
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TELEPORT_VERSION: ${{ vars.TELEPORT_VERSION }}
+  TELEPORT_CLUSTER_NAME: ${{ vars.TELEPORT_CLUSTER_NAME }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+  ROUTE53_ZONE_ID: ${{ vars.ROUTE53_ZONE_ID }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  EC2_AGENT_INSTANCE_TYPE: ${{ vars.EC2_AGENT_INSTANCE_TYPE }}
+  EC2_AGENT_SUBNET_ID: ${{ vars.EC2_AGENT_SUBNET_ID }}
+  EC2_AGENT_VPC_ID: ${{ vars.EC2_AGENT_VPC_ID }}
+  K8S_NAMESPACE_CLUSTER: ${{ vars.K8S_NAMESPACE_CLUSTER }}
+  K8S_NAMESPACE_AGENT: ${{ vars.K8S_NAMESPACE_AGENT }}
+  EC2_AGENT_ROLE_NAME: teleport-ci-ec2-agent
+  EC2_AGENT_IAM_PATH: /teleport-ci/
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  destroy:
+    name: destroy
+    runs-on: [self-hosted, linux, x64, "${{ vars.RUNNER_LABEL }}"]
+    environment: teleport-ci
+    timeout-minutes: 30
+    steps:
+      # -------------------------------------------------------------------
+      # 1. Guard.
+      # -------------------------------------------------------------------
+      # Fails before checkout, before any credential is touched.
+      - name: Confirm the typed cluster name
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TELEPORT_CLUSTER_NAME:-}" ]; then
+            echo "::error title=destroy::TELEPORT_CLUSTER_NAME is not set; refusing to guess what to destroy"
+            exit 1
+          fi
+          if [ "$CONFIRM" != "$TELEPORT_CLUSTER_NAME" ]; then
+            echo "::error title=destroy::confirmation mismatch. You typed '$CONFIRM'; expected '$TELEPORT_CLUSTER_NAME'."
+            exit 1
+          fi
+          echo "confirmed: destroying $TELEPORT_CLUSTER_NAME (keep_cluster=${{ inputs.keep_cluster }})"
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify runner tooling
+        uses: ./.github/actions/setup-tools
+
+      - name: Materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: ./scripts/kubeconfig.sh
+
+      # -------------------------------------------------------------------
+      # 2. EC2 agent. Reverse order of creation.
+      # -------------------------------------------------------------------
+      - name: terraform destroy (EC2 agent)
+        working-directory: terraform/ec2-agent
+        env:
+          # terraform destroy still evaluates variables, so the required ones must
+          # be present even though nothing new is created. proxy_addr is only used
+          # inside user-data, so a placeholder built from the cluster name is fine.
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_teleport_version: ${{ env.TELEPORT_VERSION }}
+          TF_VAR_proxy_addr: ${{ vars.TELEPORT_CLUSTER_NAME }}:443
+          TF_VAR_instance_type: ${{ env.EC2_AGENT_INSTANCE_TYPE }}
+          TF_VAR_subnet_id: ${{ env.EC2_AGENT_SUBNET_ID }}
+          TF_VAR_vpc_id: ${{ env.EC2_AGENT_VPC_ID }}
+          TF_VAR_role_name: ${{ env.EC2_AGENT_ROLE_NAME }}
+          TF_VAR_iam_path: ${{ env.EC2_AGENT_IAM_PATH }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
+          # Idempotent: with empty state this is a no-op.
+          terraform destroy -auto-approve -input=false -lock-timeout=5m
+
+      # -------------------------------------------------------------------
+      # 3. Kubernetes agent.
+      # -------------------------------------------------------------------
+      - name: helm uninstall teleport-kube-agent
+        run: |
+          set -euo pipefail
+          helm uninstall teleport-kube-agent \
+            -n "$K8S_NAMESPACE_AGENT" --ignore-not-found --wait --timeout 5m
+          echo "teleport-kube-agent removed (or was already absent)"
+
+      # -------------------------------------------------------------------
+      # 4. The cluster itself, unless keep_cluster.
+      # -------------------------------------------------------------------
+      - name: Delete the DNS record
+        if: inputs.keep_cluster != true
+        run: ./scripts/route53-delete.sh
+
+      - name: helm uninstall teleport-cluster
+        if: inputs.keep_cluster != true
+        run: |
+          set -euo pipefail
+          helm uninstall teleport-cluster \
+            -n "$K8S_NAMESPACE_CLUSTER" --ignore-not-found --wait --timeout 10m
+          echo "teleport-cluster removed (or was already absent)"
+
+      - name: Delete the Enterprise license secret
+        if: inputs.keep_cluster != true
+        run: |
+          set -euo pipefail
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" delete secret license --ignore-not-found
+          echo "license secret removed (or was already absent)"
+
+      # THIS STEP IS LOAD-BEARING (SPEC.md §6.2). `helm uninstall` leaves the PVC
+      # behind. If it survives, the next deploy silently reuses the old cluster
+      # state -- including the old host CA and the old cluster name -- and then
+      # fails in confusing ways. Deleting it is what makes the next deploy clean.
+      - name: Delete the Teleport PVC
+        if: inputs.keep_cluster != true
+        run: |
+          set -euo pipefail
+          pvcs="$(kubectl -n "$K8S_NAMESPACE_CLUSTER" get pvc \
+            -l 'app.kubernetes.io/name=teleport-cluster' \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+          if [ -z "$pvcs" ]; then
+            # Fall back to the chart's conventional name in case the labels
+            # changed in a newer chart version.
+            if kubectl -n "$K8S_NAMESPACE_CLUSTER" get pvc teleport-cluster >/dev/null 2>&1; then
+              pvcs="teleport-cluster"
+            fi
+          fi
+          if [ -z "$pvcs" ]; then
+            echo "no teleport-cluster PVC found; nothing to delete"
+            exit 0
+          fi
+          echo "deleting PVC(s): $(echo "$pvcs" | tr '\n' ' ')"
+          # shellcheck disable=SC2086
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" delete pvc $pvcs --ignore-not-found --wait=true --timeout=5m
+
+          remaining="$(kubectl -n "$K8S_NAMESPACE_CLUSTER" get pvc \
+            -l 'app.kubernetes.io/name=teleport-cluster' \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+          if [ -n "$remaining" ]; then
+            echo "::error title=destroy::PVC(s) still present after delete: $remaining. A future deploy would reuse the old cluster state. Check for a finalizer or a still-attached pod."
+            kubectl -n "$K8S_NAMESPACE_CLUSTER" get pvc -o yaml
+            exit 1
+          fi
+          echo "PVC deleted"
+
+      - name: Delete the namespaces
+        if: inputs.keep_cluster != true && inputs.delete_namespaces == true
+        run: |
+          set -euo pipefail
+          for ns in "$K8S_NAMESPACE_AGENT" "$K8S_NAMESPACE_CLUSTER"; do
+            kubectl delete namespace "$ns" --ignore-not-found --wait=true --timeout=5m
+          done
+          echo "namespaces removed (or were already absent)"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Teleport CI teardown"
+            echo
+            echo "| Item | Action |"
+            echo "|---|---|"
+            echo "| EC2 agent (Terraform) | destroyed |"
+            echo "| teleport-kube-agent | uninstalled |"
+            if [ "${{ inputs.keep_cluster }}" = "true" ]; then
+              echo "| teleport-cluster | KEPT (keep_cluster=true) |"
+              echo "| DNS record | KEPT |"
+              echo "| PVC | KEPT |"
+            else
+              echo "| DNS record | deleted |"
+              echo "| teleport-cluster | uninstalled |"
+              echo "| license secret | deleted |"
+              echo "| PVC | deleted |"
+              echo "| Namespaces | ${{ inputs.delete_namespaces && 'deleted' || 'kept' }} |"
+            fi
+            echo
+            echo "Re-running this workflow is safe: every step is individually idempotent."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Collect failure evidence
+        if: failure()
+        run: |
+          set +e
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get all,pvc -o wide
+          kubectl -n "$K8S_NAMESPACE_AGENT" get all -o wide
+          kubectl -n "$K8S_NAMESPACE_CLUSTER" get events --sort-by=.lastTimestamp | tail -n 50
+          helm list -A
+
+      - name: Remove secret material from the runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig"
+          echo "cleaned $RUNNER_TEMP"
