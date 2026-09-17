@@ -641,6 +641,43 @@ The implementation is done when:
 
 ---
 
+## 14. Addendum — corrections found during implementation
+
+These supersede the sections named. Recorded here so the spec matches what was built.
+
+1. **§5.2 / §8.2 are wrong about the CI ServiceAccount not needing cluster-admin.** The
+   `teleport-cluster` chart creates a ClusterRole and ClusterRoleBinding, so the CI SA needs
+   `escalate`/`bind` on cluster roles — which *is* cluster-admin by construction. Either accept
+   that, or pre-create the cluster-scoped RBAC out of band and set `rbac.create=false` on the
+   chart. `docs/bootstrap.md` §3.3 covers both paths.
+
+2. **§9.5 contradicts §6.1/§10.2.** §9.5 asks for `aws ssm send-command` against the EC2 agent,
+   but that needs `AmazonSSMManagedInstanceCore` on a role §6.1 requires to have *no policies*,
+   attached by a runner §7.2 deliberately denies `iam:AttachRolePolicy`. Resolution as built:
+   the agent role stays a true no-op and diagnostics use **`ec2:GetConsoleOutput`** (user-data
+   writes `TELEPORT_BOOTSTRAP_OK` / `_FAILED` to the serial console). `var.attach_ssm_policy`
+   exists, defaults to `false`, and will `AccessDenied` from the runner by design.
+
+3. **§9.3 and the `insecureSkipProxyTLSVerify: false` rule conflict.** With
+   `ACME_USE_STAGING=true` the staging CA is not publicly trusted, so the kube agent cannot
+   verify the proxy and its job will fail. Run staging passes with `skip_kube_agent: true`; the
+   rule itself stands, because in production a verification failure genuinely means ACME broke.
+
+4. **Runner IAM needs a few permissions beyond the §7.2 table** for the workflows to function
+   and to destroy what they create: `s3:GetBucketVersioning`/`GetBucketLocation`,
+   `ec2:GetConsoleOutput`, `ec2:RevokeSecurityGroupEgress`/`ModifyInstanceAttribute`/`DeleteTags`,
+   `ssm:GetParameter` on the runner-registration parameter, and `kms:Decrypt` conditioned on
+   `kms:ViaService`. Two hardening additions were made at the same time: `ec2:CreateTags` is
+   conditioned on `ec2:CreateAction` (otherwise a workflow could tag a *third party's* instance
+   `ManagedBy=github-actions` and then terminate it through the tag-scoped statement), and an
+   explicit `Deny` on `iam:AttachRolePolicy`/`PutRolePolicy`/`CreatePolicy`/`CreateUser`/
+   `CreateAccessKey`/`UpdateAssumeRolePolicy` preserves §7.2's key property even if someone
+   later attaches a broader policy to the runner role.
+
+5. **`tctl nodes ls --format=json` output shape was not verified.** `verify.sh` tries
+   `tctl get nodes --format=json` first and falls back, with jq tolerating both shapes. Confirm
+   against your cluster on the first real run.
+
 ## Appendix A — `helm/teleport-cluster.values.yaml`
 
 ```yaml
