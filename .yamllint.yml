@@ -1,0 +1,27 @@
+# yamllint configuration for lint.yml.
+#
+# Deviations from the default profile and why:
+#   line-length          GitHub Actions expressions and ::error:: annotations are
+#                        routinely long; wrapping them hurts readability.
+#   truthy check-keys    the workflow trigger key is literally `on`, which the
+#                        default profile flags as a truthy value.
+#   comments-indentation Terraform/Helm values files carry block comments aligned
+#                        to the value they document, not to the next key.
+#   document-start       `---` is not conventional in Actions workflows.
+#   indent-sequences     both `- item` styles appear across these files.
+extends: default
+
+rules:
+  line-length: disable
+  document-start: disable
+  comments-indentation: disable
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    indent-sequences: consistent
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1
