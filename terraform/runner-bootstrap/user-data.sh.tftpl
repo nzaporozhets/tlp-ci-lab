@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Terraform template (see terraform/runner-bootstrap/main.tf).
+#
+# Terraform renders this file before it ever reaches the instance: a dollar sign
+# followed by braces is a Terraform interpolation, and doubling the dollar sign
+# escapes it so that it reaches the shell verbatim. Shell variables are written
+# WITHOUT braces throughout so the two can be told apart by eye, and every heredoc
+# here is quoted so its body is not expanded by the shell (Terraform still
+# interpolates it).
+#
+# Installs the tool versions from tool-versions.env -- the same file that
+# .github/actions/setup-tools/action.yml asserts against -- then registers a
+# single non-ephemeral runner as a systemd service running as the `runner` user.
+set -euo pipefail
+set -x
+
+RUNNER_HOME=/opt/actions-runner
+RUNNER_USER=runner
+
+# ---------------------------------------------------------------------------
+# Base packages. libicu/openssl-libs/krb5-libs/zlib are the .NET dependencies the
+# GitHub Actions runner needs; installdependencies.sh does not know AL2023.
+# ---------------------------------------------------------------------------
+dnf -y --security upgrade || true
+dnf -y install \
+  jq gettext git tar gzip unzip findutils procps-ng openssl \
+  libicu openssl-libs krb5-libs zlib
+
+# ---------------------------------------------------------------------------
+# Pinned tooling.
+# ---------------------------------------------------------------------------
+curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/v${kubectl_version}/bin/linux/amd64/kubectl"
+install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-v${helm_version}-linux-amd64.tar.gz"
+tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+
+curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${terraform_version}/terraform_${terraform_version}_linux_amd64.zip"
+unzip -q -o /tmp/terraform.zip -d /tmp
+install -m 0755 /tmp/terraform /usr/local/bin/terraform
+
+curl -fsSL -o /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${awscli_version}.zip"
+unzip -q -o /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update
+rm -rf /tmp/aws /tmp/awscliv2.zip /tmp/terraform.zip /tmp/helm.tgz /tmp/kubectl /tmp/linux-amd64
+
+%{ if install_teleport_tools ~}
+# Teleport client tools for interactive debugging over SSM. tctl in CI runs inside
+# the auth pod (scripts/tctl.sh), so this is a convenience, not a dependency. The
+# systemd unit is masked: this host is not a Teleport node.
+curl -fsSL -o /tmp/teleport-install.sh https://cdn.teleport.dev/install.sh
+bash /tmp/teleport-install.sh "${teleport_version}" enterprise
+rm -f /tmp/teleport-install.sh
+systemctl disable --now teleport || true
+systemctl mask teleport || true
+%{ endif ~}
+
+# Record what got installed, so `setup-tools` failures are easy to diagnose.
+cat >/etc/teleport-ci-tools.env <<'TOOLVERSIONS'
+KUBECTL_VERSION=${kubectl_version}
+HELM_VERSION=${helm_version}
+TERRAFORM_VERSION=${terraform_version}
+AWSCLI_VERSION=${awscli_version}
+RUNNER_VERSION=${runner_version}
+TELEPORT_VERSION=${teleport_version}
+TOOLVERSIONS
+
+/usr/local/bin/kubectl version --client
+/usr/local/bin/helm version --short
+/usr/local/bin/terraform version
+/usr/local/bin/aws --version
+command -v envsubst
+
+# ---------------------------------------------------------------------------
+# Runner user and payload. The runner never runs as root (SPEC.md §7.3).
+# ---------------------------------------------------------------------------
+id -u "$RUNNER_USER" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$RUNNER_USER"
+
+install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 "$RUNNER_HOME"
+curl -fsSL -o /tmp/runner.tgz \
+  "https://github.com/actions/runner/releases/download/v${runner_version}/actions-runner-linux-x64-${runner_version}.tar.gz"
+tar -xzf /tmp/runner.tgz -C "$RUNNER_HOME"
+rm -f /tmp/runner.tgz
+chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME"
+
+# ---------------------------------------------------------------------------
+# Registration configuration. No credential is written here: the registration
+# credential lives in SSM Parameter Store and is fetched at boot with the
+# instance profile.
+# ---------------------------------------------------------------------------
+cat >/etc/github-runner.env <<'ENVFILE'
+GITHUB_OWNER=${github_owner}
+GITHUB_REPO=${github_repo}
+RUNNER_NAME=${runner_name}
+RUNNER_LABELS=self-hosted,linux,x64,${runner_label}
+CREDENTIAL_SOURCE=${credential_source}
+CREDENTIAL_SSM_PARAMETER=${credential_ssm_parameter}
+GITHUB_APP_ID=${github_app_id}
+GITHUB_APP_INSTALLATION_ID=${github_app_installation_id}
+AWS_REGION=${aws_region}
+AWS_DEFAULT_REGION=${aws_region}
+ENVFILE
+chmod 0644 /etc/github-runner.env
+
+cat >/usr/local/sbin/register-runner.sh <<'REGISTER'
+#!/usr/bin/env bash
+# Mint a short-lived GitHub Actions registration token and configure this runner.
+# Run as the `runner` user by github-runner.service's ExecStartPre.
+#
+# Idempotent: if the runner is already configured it exits 0 without touching
+# GitHub. To force a re-registration:
+#   sudo systemctl stop github-runner
+#   sudo -u runner rm -f /opt/actions-runner/.runner /opt/actions-runner/.credentials*
+#   sudo systemctl start github-runner
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. /etc/github-runner.env
+export AWS_REGION AWS_DEFAULT_REGION
+
+cd /opt/actions-runner
+
+log() { echo "register-runner: $*" >&2; }
+
+if [ -f .runner ] && [ -f .credentials ]; then
+  log "already configured as '$RUNNER_NAME'; nothing to do"
+  exit 0
+fi
+
+keyfile=""
+cleanup() { if [ -n "$keyfile" ]; then rm -f "$keyfile"; fi; }
+trap cleanup EXIT
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+api=https://api.github.com
+
+# The credential itself is only ever read into a 0600 temp file or a shell
+# variable, never logged and never passed on a command line.
+credential=$(aws ssm get-parameter --with-decryption \
+  --name "$CREDENTIAL_SSM_PARAMETER" --query Parameter.Value --output text)
+[ -n "$credential" ] || { log "SSM parameter $CREDENTIAL_SSM_PARAMETER is empty"; exit 1; }
+
+if [ "$CREDENTIAL_SOURCE" = "github_app" ]; then
+  [ -n "$GITHUB_APP_ID" ] || { log "GITHUB_APP_ID is empty"; exit 1; }
+  [ -n "$GITHUB_APP_INSTALLATION_ID" ] || { log "GITHUB_APP_INSTALLATION_ID is empty"; exit 1; }
+
+  keyfile=$(mktemp)
+  chmod 600 "$keyfile"
+  printf '%s' "$credential" >"$keyfile"
+
+  now=$(date +%s)
+  header='{"alg":"RS256","typ":"JWT"}'
+  payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID")
+  h=$(printf '%s' "$header" | b64url)
+  p=$(printf '%s' "$payload" | b64url)
+  sig=$(printf '%s' "$h.$p" | openssl dgst -sha256 -sign "$keyfile" | b64url)
+  jwt="$h.$p.$sig"
+  rm -f "$keyfile"
+  keyfile=""
+
+  installation_token=$(curl -sS --fail -X POST \
+    -H "Authorization: Bearer $jwt" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$api/app/installations/$GITHUB_APP_INSTALLATION_ID/access_tokens" | jq -r '.token // empty')
+  [ -n "$installation_token" ] || { log "could not exchange the App JWT for an installation token"; exit 1; }
+  auth="Bearer $installation_token"
+else
+  log "WARNING: using a personal access token. A GitHub App is preferred (SPEC.md §7.3)."
+  auth="Bearer $credential"
+fi
+
+registration_token=$(curl -sS --fail -X POST \
+  -H "Authorization: $auth" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "$api/repos/$GITHUB_OWNER/$GITHUB_REPO/actions/runners/registration-token" | jq -r '.token // empty')
+[ -n "$registration_token" ] || { log "could not obtain a runner registration token"; exit 1; }
+
+# --unattended --replace: a reboot, or a rebuild of the instance, re-registers
+# cleanly over the previous entry of the same name.
+./config.sh --unattended --replace \
+  --url "https://github.com/$GITHUB_OWNER/$GITHUB_REPO" \
+  --token "$registration_token" \
+  --name "$RUNNER_NAME" \
+  --labels "$RUNNER_LABELS" \
+  --work _work
+
+log "registered '$RUNNER_NAME' with labels: $RUNNER_LABELS"
+REGISTER
+chmod 0755 /usr/local/sbin/register-runner.sh
+
+cat >/etc/systemd/system/github-runner.service <<'UNIT'
+[Unit]
+Description=GitHub Actions self-hosted runner (teleport-ci)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=runner
+Group=runner
+WorkingDirectory=/opt/actions-runner
+Environment=HOME=/home/runner
+Environment=RUNNER_ALLOW_RUNASROOT=0
+EnvironmentFile=/etc/github-runner.env
+ExecStartPre=/usr/local/sbin/register-runner.sh
+ExecStart=/opt/actions-runner/run.sh
+Restart=always
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now github-runner.service
+
+systemctl --no-pager status github-runner.service || true
+echo "RUNNER_BOOTSTRAP_OK"

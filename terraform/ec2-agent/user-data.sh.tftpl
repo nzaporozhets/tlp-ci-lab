@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Terraform template (see terraform/ec2-agent/main.tf). Rendered variables:
+#   teleport_version, proxy_addr, token_name, sentinel_path, teleport_labels
+#
+# Terraform renders this file before it ever reaches the instance: a dollar sign
+# followed by braces is a Terraform interpolation, and doubling the dollar sign
+# escapes it so that it reaches the shell verbatim. To keep the two apart by eye,
+# shell variables below are written without braces throughout.
+#
+# cloud-init captures this script's stdout/stderr into
+# /var/log/cloud-init-output.log, which is also what `aws ec2 get-console-output`
+# returns -- that is how deploy.yml retrieves these logs without granting the
+# agent role any SSM permissions.
+set -euo pipefail
+set -x
+
+SENTINEL="${sentinel_path}"
+mkdir -p "$(dirname "$SENTINEL")"
+rm -f "$SENTINEL"
+
+# Completion sentinel (SPEC.md §6.1 step 4): lets an operator tell "user-data is
+# still running" from "user-data failed".
+finish() {
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "ok" >"$SENTINEL"
+    echo "TELEPORT_BOOTSTRAP_OK"
+  else
+    echo "failed rc=$rc" >"$SENTINEL"
+    echo "TELEPORT_BOOTSTRAP_FAILED rc=$rc"
+  fi
+}
+trap finish EXIT
+
+# ---------------------------------------------------------------------------
+# Identity, via IMDSv2 (the instance requires tokens).
+# ---------------------------------------------------------------------------
+IMDS=http://169.254.169.254
+IMDS_TOKEN=$(curl -sS --fail --max-time 5 -X PUT "$IMDS/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+INSTANCE_ID=$(curl -sS --fail --max-time 5 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  "$IMDS/latest/meta-data/instance-id")
+echo "instance id: $INSTANCE_ID"
+
+# ---------------------------------------------------------------------------
+# Install Teleport at the pinned version. The version is passed explicitly so the
+# node can never drift ahead of the Auth Service (SPEC.md §9.4).
+# ---------------------------------------------------------------------------
+curl -fsSL -o /tmp/teleport-install.sh https://cdn.teleport.dev/install.sh
+bash /tmp/teleport-install.sh "${teleport_version}" enterprise
+rm -f /tmp/teleport-install.sh
+/usr/local/bin/teleport version || teleport version
+
+# ---------------------------------------------------------------------------
+# Configuration. No secret is written: with the `iam` join method the node proves
+# its identity with a signed sts:GetCallerIdentity request (SPEC.md §3.1).
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc
+umask 077
+cat >/etc/teleport.yaml <<TELEPORT_YAML
+version: v3
+teleport:
+  # Use the instance ID as the Teleport node name so that Teleport's node list
+  # maps one-to-one onto EC2 instances (scripts/verify.sh relies on this).
+  # NOTE: this heredoc is unquoted so that $INSTANCE_ID expands -- do not put
+  # backticks or unescaped $ in it.
+  nodename: "$INSTANCE_ID"
+  join_params:
+    token_name: ${token_name}
+    method: iam
+  proxy_server: ${proxy_addr}
+  log:
+    output: stderr
+    severity: INFO
+    format:
+      output: json
+      extra_fields: ["timestamp", "level", "component", "caller"]
+ssh_service:
+  enabled: true
+  labels:
+    instance-id: "$INSTANCE_ID"
+%{ for key, value in teleport_labels ~}
+    ${key}: "${value}"
+%{ endfor ~}
+auth_service:
+  enabled: false
+proxy_service:
+  enabled: false
+TELEPORT_YAML
+chmod 0600 /etc/teleport.yaml
+
+# ---------------------------------------------------------------------------
+# Start.
+# ---------------------------------------------------------------------------
+systemctl enable --now teleport
+
+# Give the agent a chance to actually join, so a failure shows up here (in the
+# console log) rather than only as a missing node in verify.
+for _attempt in $(seq 1 30); do
+  if systemctl is-active --quiet teleport; then
+    break
+  fi
+  sleep 5
+done
+
+if ! systemctl is-active --quiet teleport; then
+  echo "teleport failed to start; recent journal:"
+  journalctl -u teleport --no-pager -n 200 || true
+  exit 1
+fi
+
+echo "teleport is active; recent journal:"
+journalctl -u teleport --no-pager -n 50 || true
