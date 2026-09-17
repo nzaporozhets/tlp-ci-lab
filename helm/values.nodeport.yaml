@@ -1,0 +1,83 @@
+# Helm values for the teleport-cluster chart -- NODEPORT template.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE EXISTS AS A SEPARATE COPY
+# ---------------------------------------------------------------------------
+# This file is helm/values.yaml with exactly two differences:
+#
+#   1. `service.type` is hardcoded to `NodePort`.
+#   2. It adds `publicAddr`, which the default file does not set.
+#
+# deploy.yml picks this file automatically when the SERVICE_TYPE repository
+# variable is `NodePort`. Everything else is identical, so read the comments in
+# helm/values.yaml for the reasoning behind the shared settings.
+#
+# Two near-identical readable files beat one file full of conditionals: the
+# templating tool used by the workflow (`envsubst`) does plain variable
+# substitution and cannot express "add this key only when...". Duplicating a
+# hundred lines of comments is a small price for a file you can read top to
+# bottom and know what Helm will receive.
+#
+# ---------------------------------------------------------------------------
+# THE NODEPORT TRAP -- READ THIS BEFORE USING NODEPORT
+# ---------------------------------------------------------------------------
+# With `service.type: NodePort`, Kubernetes exposes the proxy on a randomly
+# assigned high port (30000-32767) on every node. The chart, however, does not
+# know that: it still renders `public_addr: <clusterName>:443` into the Teleport
+# config. Teleport hands `public_addr` out to clients and uses it in redirects,
+# so without a correction every client would be told to connect on port 443 --
+# where nothing is listening.
+#
+# The correction is `publicAddr` below, fed from the PUBLIC_ADDR repository
+# variable, which must include the node port, e.g.
+# `teleport.example.com:32443`. deploy.yml refuses to run if SERVICE_TYPE is
+# NodePort and PUBLIC_ADDR is empty.
+#
+# The node port CANNOT be pinned from these values: the chart builds the
+# Service's port list itself and exposes no field for `nodePort`. So Kubernetes
+# assigns it, and it can change if the Service is ever deleted and recreated --
+# at which point you must update PUBLIC_ADDR to match. That fragility is the
+# main reason `LoadBalancer` is the recommended default.
+# ---------------------------------------------------------------------------
+
+chartMode: standalone
+
+clusterName: "${TELEPORT_CLUSTER_NAME}"
+
+enterprise: true
+
+licenseSecretName: "${LICENSE_SECRET_NAME}"
+
+tls:
+  existingSecretName: "${TLS_SECRET_NAME}"
+
+proxyListenerMode: multiplex
+
+persistence:
+  enabled: true
+  volumeSize: "${VOLUME_SIZE}"
+  storageClassName: "${STORAGE_CLASS}"
+
+service:
+  # Hardcoded, not templated: this file is only ever used for NodePort, and
+  # seeing the literal value here is clearer than another placeholder.
+  type: NodePort
+
+# The whole reason this file exists. `publicAddr` overrides the proxy's
+# `public_addr`, so Teleport advertises the host AND the node port that clients
+# must actually dial. It is a list because Teleport accepts several public
+# addresses; one entry is right for this MVP.
+publicAddr: ["${PUBLIC_ADDR}"]
+
+highAvailability:
+  # MUST stay 1 -- SQLite on a ReadWriteOnce volume. See helm/values.yaml.
+  replicaCount: 1
+
+proxy:
+  highAvailability:
+    # One proxy pod, matching helm/values.yaml. See the comment there.
+    replicaCount: 1
+
+log:
+  level: INFO
+  format: json

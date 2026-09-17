@@ -1,0 +1,116 @@
+# Helm values for the teleport-cluster chart -- DEFAULT template.
+#
+# ---------------------------------------------------------------------------
+# HOW THIS FILE IS USED
+# ---------------------------------------------------------------------------
+# This is a *template*, not a finished values file. The `${...}` placeholders
+# are filled in by `envsubst` inside .github/workflows/deploy.yml, using the
+# repository variables listed in docs/setup.md. The workflow writes the result
+# to `rendered-values.yaml` and prints it in the run log, so you can always see
+# exactly what was sent to Helm.
+#
+# Use this file when SERVICE_TYPE is `LoadBalancer` (the default) or
+# `ClusterIP`. If SERVICE_TYPE is `NodePort`, the workflow uses
+# helm/values.nodeport.yaml instead -- see the comment at the top of that file
+# for why a separate file is needed.
+#
+# ---------------------------------------------------------------------------
+# EDITING RULES
+# ---------------------------------------------------------------------------
+# * Anything written as ${NAME} must have a matching repository variable, or
+#   envsubst will silently substitute an empty string.
+# * Do NOT add an `acme:` key. The chart hard-errors with
+#   "Cannot set both acme.enabled and tls.existingSecretName, choose one or the
+#   other" -- this project always uses an operator-provisioned certificate.
+# ---------------------------------------------------------------------------
+
+# `standalone` runs one auth pod that keeps all cluster state in a SQLite file
+# on a PersistentVolumeClaim. It is the simplest mode the chart offers and needs
+# no external database. See `highAvailability.replicaCount` below for the
+# constraint this creates.
+chartMode: standalone
+
+# The DNS name your users will type, e.g. `teleport.example.com`. Teleport bakes
+# this into the cluster's certificate authority on first start, so it is
+# EFFECTIVELY IMMUTABLE: changing it later means a new cluster, not a rename.
+clusterName: "${TELEPORT_CLUSTER_NAME}"
+
+# Teleport Enterprise. This selects the image
+# `public.ecr.aws/gravitational/teleport-ent-distroless:<version>` instead of
+# the OSS image, and makes `licenseSecretName` mandatory.
+enterprise: true
+
+# Name of a Secret that you created by hand, in the same namespace, holding your
+# Teleport Enterprise licence. The chart mounts it at
+# /var/lib/license/license.pem, so the key inside the Secret MUST be named
+# exactly `license.pem`. deploy.yml checks the key name for you, because the
+# chart's failure mode when it is wrong is an opaque crash loop.
+licenseSecretName: "${LICENSE_SECRET_NAME}"
+
+# Use the TLS certificate you provisioned yourself, rather than having Teleport
+# request one from Let's Encrypt. This must be a standard `kubernetes.io/tls`
+# Secret with `tls.crt` and `tls.key` keys; the chart mounts it and renders
+# `https_keypairs` pointing at /etc/teleport-tls/tls.crt and
+# /etc/teleport-tls/tls.key.
+#
+# The rendered Teleport config also contains `https_keypairs_reload_interval:
+# 12h`, which means Teleport re-reads the certificate from this Secret on its
+# own. RENEWING THE CERTIFICATE NEEDS NO REDEPLOY AND NO POD RESTART -- just
+# update the Secret. See docs/runbook.md.
+#
+# Mutually exclusive with `acme` (hard error) and with
+# highAvailability.certManager.
+tls:
+  existingSecretName: "${TLS_SECRET_NAME}"
+
+# Serve every Teleport protocol (web UI, SSH, Kubernetes, databases) on the
+# single TCP port 443, multiplexed by ALPN/SNI. One port is far easier to reason
+# about and to open in a firewall.
+#
+# Tradeoff to know about: with multiplexing, Kubernetes and database clients
+# must go through `tsh` (or Teleport Connect) rather than connecting to a
+# dedicated port. That is an acceptable MVP tradeoff; see docs/runbook.md.
+proxyListenerMode: multiplex
+
+# The SQLite backend needs a disk that survives pod restarts.
+persistence:
+  enabled: true
+  # Requested size of the PersistentVolumeClaim. 10Gi is generous for an MVP:
+  # the SQLite backend stores cluster state, not session recordings at scale.
+  volumeSize: "${VOLUME_SIZE}"
+  # Which StorageClass to request. The chart omits this field entirely when the
+  # value is an empty string, which makes Kubernetes use the cluster's default
+  # StorageClass -- so leaving the STORAGE_CLASS repository variable unset is
+  # both safe and the normal case.
+  storageClassName: "${STORAGE_CLASS}"
+
+service:
+  # `LoadBalancer` asks your cloud or MetalLB for an external IP -- the
+  # recommended default. `ClusterIP` gives an in-cluster address only, which
+  # means you need your own Ingress or `kubectl port-forward` to reach it.
+  # For `NodePort`, use helm/values.nodeport.yaml instead of this file.
+  type: "${SERVICE_TYPE}"
+
+highAvailability:
+  # MUST stay 1. `chartMode: standalone` keeps state in SQLite on a
+  # ReadWriteOnce volume, which only one node can mount for writing. A second
+  # auth pod would either fail to schedule or corrupt the database. Scaling out
+  # requires a different chartMode with an external backend, which is out of
+  # scope for this MVP.
+  replicaCount: 1
+
+proxy:
+  highAvailability:
+    # The proxy is stateless, so the chart defaults it to 2 replicas even when
+    # highAvailability.replicaCount is 1. We pin it to 1 as well, so this MVP
+    # runs exactly one auth pod and one proxy pod: fewer moving parts, and
+    # `kubectl logs` shows you the whole story without picking a replica.
+    # Raise this to 2 or more once you want proxy redundancy -- it is safe,
+    # because the proxies read their certificate from the Secret above.
+    replicaCount: 1
+
+log:
+  level: INFO
+  # JSON logs so `kubectl logs ... | jq` works. Switch to `text` if you find
+  # yourself reading them raw.
+  format: json
