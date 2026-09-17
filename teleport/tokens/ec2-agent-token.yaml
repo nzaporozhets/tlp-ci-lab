@@ -1,0 +1,25 @@
+# Provision token for the EC2 SSH agent.
+#
+# Rendered with `envsubst` (variables: AWS_ACCOUNT_ID, EC2_AGENT_ROLE_NAME) and
+# applied with `tctl create -f` (upsert) by scripts/tctl.sh.
+#
+# Safe in plaintext: with the `iam` join method the node proves its identity by
+# presenting a signed `sts:GetCallerIdentity` request, which Auth executes against
+# STS. There is no shared secret, so the token name grants nothing on its own.
+# See SPEC.md §3.1.
+kind: token
+version: v2
+metadata:
+  name: ec2-agent-token
+  expires: "2050-01-01T00:00:00Z"
+spec:
+  roles: [Node]
+  join_method: iam
+  allow:
+    # aws_account is a string, not a number -- quoting matters.
+    - aws_account: "${AWS_ACCOUNT_ID}"
+      # The instance's credentials present an assumed-role ARN whose session name
+      # is the instance ID. Note that the role *path* (/teleport-ci/) does not
+      # appear in an sts assumed-role ARN, only the bare role name.
+      # `*` and `?` wildcards are supported.
+      aws_arn: "arn:aws:sts::${AWS_ACCOUNT_ID}:assumed-role/${EC2_AGENT_ROLE_NAME}/i-*"

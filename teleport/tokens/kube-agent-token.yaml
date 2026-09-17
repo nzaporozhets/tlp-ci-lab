@@ -1,0 +1,26 @@
+# Provision token for the in-cluster Kubernetes agent.
+#
+# Rendered with `envsubst` (variables: K8S_NAMESPACE_AGENT) and applied with
+# `tctl create -f` (upsert) by scripts/tctl.sh, so re-applying is idempotent.
+#
+# This file is safe to keep in plaintext in git: with the `kubernetes` /
+# `in_cluster` join method there is no shared secret. The Auth Service validates
+# the agent's ServiceAccount JWT against the Kubernetes API, so the token *name*
+# grants nothing on its own. See SPEC.md §3.1.
+kind: token
+version: v2
+metadata:
+  name: kube-agent-token
+  # Delegated join methods are re-validated on every join, so a long-lived token
+  # is fine -- and required, since the agent re-joins on every restart.
+  expires: "2050-01-01T00:00:00Z"
+spec:
+  roles: [Kube]
+  join_method: kubernetes
+  kubernetes:
+    type: in_cluster
+    allow:
+      # "namespace:serviceaccountname". Must match the ServiceAccount rendered by
+      # the teleport-kube-agent chart, which helm/teleport-kube-agent.values.yaml
+      # pins to `teleport-kube-agent`. lint.yml asserts the two agree.
+      - service_account: "${K8S_NAMESPACE_AGENT}:teleport-kube-agent"

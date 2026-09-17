@@ -1,0 +1,53 @@
+# teleport-kube-agent Helm values.
+#
+# Rendered with `envsubst` (explicit variable list) before use. Variables:
+#
+#   TELEPORT_CLUSTER_NAME  proxy address and Teleport cluster name.
+#   KUBE_CLUSTER_NAME      display name of this Kubernetes cluster in Teleport.
+#
+# See SPEC.md §6.1 "Job kube-agent".
+
+proxyAddr: "${TELEPORT_CLUSTER_NAME}:443"
+
+# Kubernetes access only -- no app/db/discovery enrolment (SPEC.md §12).
+roles: kube
+kubeClusterName: "${KUBE_CLUSTER_NAME}"
+
+enterprise: true
+
+# `joinParams` rather than `authToken`: `authToken` only supports the `token`
+# join method. With method `kubernetes` (in-cluster) the Auth Service validates
+# the agent's projected ServiceAccount token, so `tokenName` is NOT a secret.
+joinParams:
+  method: kubernetes
+  tokenName: kube-agent-token
+
+# Required whenever joinParams.method is `kubernetes`: it makes the chart mount a
+# projected ServiceAccount token and point Teleport at it.
+teleportClusterName: "${TELEPORT_CLUSTER_NAME}"
+
+# The ServiceAccount name here MUST equal the `spec.kubernetes.allow[].service_account`
+# value in teleport/tokens/kube-agent-token.yaml. It is pinned explicitly (rather
+# than left to the chart's release-name default) so a rename cannot silently break
+# joining, and lint.yml cross-checks the rendered name against the token file.
+serviceAccount:
+  create: true
+  name: teleport-kube-agent
+
+highAvailability:
+  replicaCount: 1
+
+# MUST stay false. If the agent cannot verify the proxy certificate then ACME did
+# not complete, and the correct response is to fail the deploy -- not to skip
+# verification. See SPEC.md §6.1 and §10.
+insecureSkipProxyTLSVerify: false
+
+labels:
+  env: ci
+  managed-by: github-actions
+
+log:
+  level: INFO
+  format: json
+  output: stderr
+  extraFields: ["timestamp", "level", "component", "caller"]
