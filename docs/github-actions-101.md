@@ -482,7 +482,7 @@ into the next step. `$GITHUB_ENV` is how you carry one across.
 
 Appending `NAME=value` to that file makes `NAME` an environment variable in every
 **later** step of the job (not in the current one). That is how the certificate's
-expiry date, discovered in step 7, reaches the summary written in step 17. There is
+expiry date, discovered in step 8, reaches the summary written in step 18. There is
 a sibling, `$GITHUB_PATH`, which does the same thing for `PATH` —
 `.github/workflows/lint.yml:103`:
 

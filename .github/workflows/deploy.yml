@@ -2,7 +2,7 @@
 # Deploy Teleport cluster v0.1
 # =============================================================================
 # WHAT THIS FILE IS
-# 
+#
 # This is a GitHub Actions *workflow*. GitHub looks in `.github/workflows/` for
 # YAML files like this one and runs them when the event described under `on:`
 # happens. Nothing outside this directory is magic -- the filename does not
@@ -264,7 +264,7 @@ jobs:
       # Unlike GitHub-hosted runners, which come loaded with software, YOUR
       # runner has only what you installed. runner/install-runner.sh installs
       # all of these. Checking them here turns "helm: command not found" buried
-      # in step 12 into a clear message in step 4.
+      # in step 10 into a clear message in step 4.
       - name: Check the required command-line tools are installed
         run: |
           set -euo pipefail
@@ -289,7 +289,10 @@ jobs:
           helm version
           echo "jq      $(jq --version)"
           openssl version
-      
+
+      # =======================================================================
+      # STEP 5 -- run tbot to get Kubernetes credentials for this run.
+      # =======================================================================
       - name: Run tbot to get kubeconfig
         run: |
           set -euo pipefail
@@ -297,7 +300,7 @@ jobs:
           tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
 
       # =======================================================================
-      # STEP 5 -- check the runner can actually talk to Kubernetes.
+      # STEP 6 -- check the runner can actually talk to Kubernetes.
       # =======================================================================
       # THIS IS THE MOST LIKELY THING TO FAIL ON YOUR FIRST RUN, and the whole
       # reason this step exists separately: without it, broken credentials show
@@ -371,7 +374,7 @@ jobs:
           fi
 
       # =======================================================================
-      # STEP 6 -- check the namespace exists. Do NOT create it.
+      # STEP 7 -- check the namespace exists. Do NOT create it.
       # =======================================================================
       # Creating it would be one line, and would be wrong. The namespace is
       # supposed to already contain two secrets that you provisioned by hand. An
@@ -397,7 +400,7 @@ jobs:
           echo "Namespace '${K8S_NAMESPACE}' exists."
 
       # =======================================================================
-      # STEP 7 -- inspect the TLS certificate.
+      # STEP 8 -- inspect the TLS certificate.
       # =======================================================================
       # A certificate that does not cover your cluster name produces a
       # *successful* deploy and then browser warnings for every user, discovered
@@ -526,7 +529,7 @@ jobs:
           rm -f "${cert}"
 
       # =======================================================================
-      # STEP 8 -- check the licence secret's key NAME.
+      # STEP 9 -- check the licence secret's key NAME.
       # =======================================================================
       # The chart mounts this secret at /var/lib/license/license.pem and tells
       # Teleport to read that exact path. If the key inside the secret is called
@@ -569,11 +572,11 @@ jobs:
           echo "OK: 'license.pem' key present."
 
       # =======================================================================
-      # STEP 9 -- check the requested chart version exists, and fetch it.
+      # STEP 10 -- check the requested chart version exists, and fetch it.
       # =======================================================================
       # A typo in TELEPORT_VERSION is caught here in two seconds instead of after
       # a failed image pull. We also download the chart to a local directory,
-      # because `helm lint` in step 11 needs a chart on disk and has no
+      # because `helm lint` in step 12 needs a chart on disk and has no
       # `--version` flag of its own.
       - name: Check the Teleport chart version exists and download it
         run: |
@@ -615,7 +618,7 @@ jobs:
           echo "Chart unpacked to ./chart/teleport-cluster"
 
       # =======================================================================
-      # STEP 10 -- turn the values template into a real values file.
+      # STEP 11 -- turn the values template into a real values file.
       # =======================================================================
       # helm/values.yaml is a *template* containing ${PLACEHOLDERS}. `envsubst`
       # replaces each one with the matching environment variable -- which, thanks
@@ -679,7 +682,7 @@ jobs:
           fi
 
       # =======================================================================
-      # STEP 11 -- ask Helm to check its own work, without touching the cluster.
+      # STEP 12 -- ask Helm to check its own work, without touching the cluster.
       # =======================================================================
       # `helm lint` checks the chart and values for structural problems.
       # `helm template` renders the full set of Kubernetes manifests locally --
@@ -733,7 +736,7 @@ jobs:
           echo "Validation passed."
 
       # =======================================================================
-      # STEP 12 -- the fork in the road: dry run stops here.
+      # STEP 13 -- the fork in the road: dry run stops here.
       # =======================================================================
       # Everything above is read-only. Everything below changes your cluster.
       #
@@ -756,7 +759,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # =======================================================================
-      # STEP 13 -- install, or upgrade if it is already there.
+      # STEP 14 -- install, or upgrade if it is already there.
       # =======================================================================
       # `helm upgrade --install` is the reason this workflow is safe to press
       # twice: if the release does not exist Helm installs it, and if it does
@@ -780,7 +783,7 @@ jobs:
           helm status "${HELM_RELEASE}" -n "${K8S_NAMESPACE}"
 
       # =======================================================================
-      # STEP 14 -- confirm both workloads finished rolling out.
+      # STEP 15 -- confirm both workloads finished rolling out.
       # =======================================================================
       # `helm --wait` already waited, but this reports per-workload status, which
       # is what you want in the log when only one of the two is unhappy.
@@ -816,7 +819,7 @@ jobs:
           kubectl get pods -n "${K8S_NAMESPACE}" -o wide
 
       # =======================================================================
-      # STEP 15 -- find the address you must point DNS at.
+      # STEP 16 -- find the address you must point DNS at.
       # =======================================================================
       # Teleport is now running, but nobody can reach it by name until a DNS
       # record exists. What that record should contain depends entirely on the
@@ -926,7 +929,7 @@ jobs:
           esac
 
       # =======================================================================
-      # STEP 16 -- prove TLS works, without waiting for DNS.
+      # STEP 17 -- prove TLS works, without waiting for DNS.
       # =======================================================================
       # The useful trick in this whole workflow. `curl --resolve host:port:ADDRESS`
       # tells curl "when you look up this hostname, use this address" -- so curl
@@ -991,7 +994,7 @@ jobs:
           rm -f ping.json
 
       # =======================================================================
-      # STEP 17 -- write the summary page: what to do next.
+      # STEP 18 -- write the summary page: what to do next.
       # =======================================================================
       # Everything an operator needs after a successful deploy, on one page, so
       # they never have to reconstruct it from the log.
@@ -1080,7 +1083,7 @@ jobs:
           echo "First user:   kubectl exec -n ${K8S_NAMESPACE} deploy/${auth_deploy} -- tctl users add <name> --roles=editor,access"
 
       # =======================================================================
-      # STEP 18 -- if anything above failed, collect evidence.
+      # STEP 19 -- if anything above failed, collect evidence.
       # =======================================================================
       # `if: failure()` means "run this step only when an earlier step in this
       # job failed". Without it, a step is skipped as soon as anything fails --
