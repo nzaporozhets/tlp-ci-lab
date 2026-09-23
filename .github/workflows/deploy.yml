@@ -302,7 +302,7 @@ jobs:
           # shellcheck disable=SC2016
           envsubst '${RUNNER_TEMP}' < tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
           tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
-          echo "KUBECONFIG=/opt/machine-id/kubeconfig.yaml" >> "$GITHUB_ENV"
+          echo "KUBECONFIG=${RUNNER_TEMP}/machine-id/kubeconfig.yaml" >> "$GITHUB_ENV"
 
       # =======================================================================
       # STEP 6 -- check the runner can actually talk to Kubernetes.
