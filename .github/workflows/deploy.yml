@@ -289,6 +289,12 @@ jobs:
           helm version
           echo "jq      $(jq --version)"
           openssl version
+      
+      - name: Run tbot to get kubeconfig
+        run: |
+          set -euo pipefail
+          envsubst '${RUNNER_TEMP}' < tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
+          tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
 
       # =======================================================================
       # STEP 5 -- check the runner can actually talk to Kubernetes.
