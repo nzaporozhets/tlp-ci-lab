@@ -1,8 +1,8 @@
 # =============================================================================
-# Deploy Teleport cluster
+# Deploy Teleport cluster v0.1
 # =============================================================================
 # WHAT THIS FILE IS
-#
+# 
 # This is a GitHub Actions *workflow*. GitHub looks in `.github/workflows/` for
 # YAML files like this one and runs them when the event described under `on:`
 # happens. Nothing outside this directory is magic -- the filename does not
