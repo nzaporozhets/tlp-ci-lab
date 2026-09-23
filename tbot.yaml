@@ -15,4 +15,4 @@ services:
     destination:
       type: directory
 
-      path: /opt/machine-id
+      path: "${RUNNER_TEMP}/machine-id"
