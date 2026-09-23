@@ -677,11 +677,13 @@ jobs:
           # A placeholder left behind means a variable was not exported: catch it
           # now rather than letting Helm receive a literal "${...}" string.
           # Single quotes again keep the dollar sign literal for grep.
+          # Comment lines are skipped: the template's own comments mention
+          # ${NAME} as an example, and comments never reach Helm anyway.
           # shellcheck disable=SC2016
-          if grep -q '\${' rendered-values.yaml; then
+          if grep -v '^[[:space:]]*#' rendered-values.yaml | grep -q '\${'; then
             echo "Unsubstituted placeholders remain in rendered-values.yaml:"
             # shellcheck disable=SC2016
-            grep -n '\${' rendered-values.yaml
+            grep -n '\${' rendered-values.yaml | grep -v '^[0-9]*:[[:space:]]*#'
             echo "::error title=Template not fully rendered::A \${PLACEHOLDER} was left in rendered-values.yaml"
             exit 1
           fi
