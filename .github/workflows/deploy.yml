@@ -73,6 +73,7 @@ concurrency:
 # -----------------------------------------------------------------------------
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -296,6 +297,9 @@ jobs:
       - name: Run tbot to get kubeconfig
         run: |
           set -euo pipefail
+          # Single quotes on purpose: envsubst needs the literal text
+          # '${RUNNER_TEMP}' as its list of variables to replace (see step 11).
+          # shellcheck disable=SC2016
           envsubst '${RUNNER_TEMP}' < tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
           tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
 
