@@ -123,7 +123,7 @@ jobs:
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
         run:
-          set -eou pipefall
+          set -eou pipefail
           echo "This was a dry run."
           {
             echo "## Dry run completed"
