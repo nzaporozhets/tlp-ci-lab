@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Export required variables
-        run: cat "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/gh_vars.env" >> "$GITHUB_ENV"
+        run: cat "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/gh_vars.env" >> "$GITHUB_ENV"
 
       - name: Check that environment for deployment is configured
         run: |
@@ -43,7 +43,7 @@ jobs:
       - name: Verify Helm config for the region is present
         run: |
           set -euo pipefail
-          if [ ! -f "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" ]; then
+          if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" ]; then
             echo "Helm config for the region seems to be missing. Please create the values.yaml file in /[env name]/helm/ "
             exit 1
           fi          
@@ -104,7 +104,7 @@ jobs:
         run:
           set -eou pipefall
           helm lint chart/teleport-cluster \
-          --values "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
+          --values "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
           --namespace "${K8S_NAMESPACE}"
 
         #TODO STOP DRYRUN HERE#
@@ -132,7 +132,7 @@ jobs:
           set -euo pipefail
           helm upgrade --install teleport-cluster teleport/teleport-cluster \
           --version "${TELEPORT_VERSION}" \
-          --values "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
+          --values "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
           --namespace "${K8S_NAMESPACE}" \
           --wait \
           --timeout 15m
