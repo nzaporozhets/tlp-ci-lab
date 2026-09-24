@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" ]; then
-            echo "Helm config for the region seems to be missing. Please create the values.yaml file in /[env name]/helm/ "
+            echo "Helm config for the region seems to be missing. Please create the teleport-cluster-values.yaml file in /[env name]/helm/ "
             exit 1
           fi          
 
