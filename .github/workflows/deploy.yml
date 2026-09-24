@@ -39,7 +39,22 @@ jobs:
             echo "The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV" in the configs/[env name]/gh_vars.yaml if running on push.)"
             exit 1;
           fi
-#TODO add env var verification
+
+      - name: Check the required repository variables are set
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in TELEPORT_VERSION K8S_NAMESPACE ; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "These env variables are empty or not set: ${missing[*]}. Add to the configs/${DEPLOY_ENV}/gh_vars.yaml"
+            exit 1
+          fi
+
       - name: Verify Helm config for the region is present
         run: |
           set -euo pipefail
@@ -117,8 +132,6 @@ jobs:
           helm lint chart/teleport-cluster \
           --values "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
           --namespace "${K8S_NAMESPACE}"
-
-        #TODO STOP DRYRUN HERE#
 
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
