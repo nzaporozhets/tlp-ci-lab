@@ -40,7 +40,7 @@ jobs:
             exit 1;
           fi
 
-      - name: Check the required repository variables are set
+      - name: Check the required env variables are set
         run: |
           set -euo pipefail
           missing=()
@@ -160,22 +160,19 @@ jobs:
           --namespace "${K8S_NAMESPACE}" \
           --wait \
           --timeout 15m
-
-      - name: Verify Helm install successful
+#todo: configure proper checks for pods and svc
+      - name: Check Auth and Proxy pods status
         if: ${{ !inputs.dry_run }}    
         run: |
           set -euo pipefail
-          helm status teleport-cluster --namespace "${K8S_NAMESPACE}"
+          kubectl get po -n ${K8S_NAMESPACE}
 
-      - name: Verify Helm install successful
+      - name: Get the LB data to setup DNS
         if: ${{ !inputs.dry_run }}    
         run: |
           set -euo pipefail
+          kubectl get services/teleport-cluster -n ${K8S_NAMESPACE}
 
-      - name: Verify Helm install successful
-        if: ${{ !inputs.dry_run }}    
-        run: |
-          set -euo pipefail
 
 
       
