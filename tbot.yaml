@@ -1,0 +1,18 @@
+version: v2
+proxy_server: test02.zap.tams.sh:443
+onboarding:
+  join_method: github
+  token: github-bot
+certificate_ttl: 5m
+storage:
+  type: memory
+services:
+  - type: kubernetes/v2
+    selectors:
+      - name: nikita-eks-certlab
+      - labels:
+          env: certlab
+    destination:
+      type: directory
+
+      path: "${RUNNER_TEMP}/machine-id"

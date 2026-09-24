@@ -1,0 +1,14 @@
+# Credentials and certificates. 
+*.pem
+*.key
+*.crt
+license.pem
+kubeconfig
+kubeconfig.*
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,38 @@
+# yamllint configuration.
+#
+# yamllint checks YAML formatting: indentation, trailing whitespace, and -- the
+# one that actually catches bugs -- duplicate keys, which YAML accepts silently
+# with the last one winning.
+#
+# It runs in .github/workflows/lint.yml over .github/workflows/ and helm/.
+# To run it yourself before pushing:
+#
+#     yamllint --strict --config-file .yamllint.yml .github/workflows/ helm/
+#
+# Deviations from yamllint's default profile, and why each one is here:
+#
+#   line-length          GitHub Actions expressions and the ::error:: annotation
+#                        lines in this project are long by nature, and wrapping
+#                        them would hurt readability more than the long line does.
+#   truthy check-keys    a workflow's trigger key is literally `on`, which the
+#                        default profile flags as an unquoted boolean.
+#   comments-indentation the Helm values templates carry block comments aligned
+#                        to the value they document rather than to the next key.
+#   document-start       a leading `---` is not conventional in Actions workflows.
+#   indent-sequences     both `- item` styles appear in these files.
+extends: default
+
+rules:
+  line-length: disable
+  document-start: disable
+  comments-indentation: disable
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    indent-sequences: consistent
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1

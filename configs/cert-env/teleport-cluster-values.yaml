@@ -1,0 +1,60 @@
+chartMode: standalone
+clusterName: certlab.zap.tams.sh                 # Name of your cluster. Use the FQDN you intend to configure in DNS below.
+proxyListenerMode: multiplex
+
+highAvailability:
+  replicaCount: 2                                 # Number of replicas to configure
+  certManager:
+    enabled: false                                # Disabled as we're using pre-ocnfigured AWS cert
+
+# Indicate that this is a Teleport Enterprise deployment. Set to false for
+# Teleport Community Edition.
+enterprise: true                                  
+# If you are running Kubernetes 1.23 or above, disable PodSecurityPolicies
+licenseSecretName: "license" 
+tls:
+  existingSecretName: "teleport-tls" 
+
+acme: false
+
+persistence:
+  enabled: false #override as we're using a Postgres backend
+
+auth:
+  teleportConfig:
+    teleport:
+      storage:
+        type: postgresql
+        conn_string: postgresql://teleport-pg@pgbackend.zap.tams.sh:5432/teleport_backend?sslmode=verify-full&sslrootcert=/etc/ssl/pgclient/ca.crt&sslcert=/etc/ssl/pgclient/client.crt&sslkey=/etc/ssl/pgclient/client.key
+        audit_events_uri: postgresql://teleport-pg@pgbackend.zap.tams.sh:5432/teleport_audit?sslmode=verify-full&sslrootcert=/etc/ssl/pgclient/ca.crt&sslcert=/etc/ssl/pgclient/client.crt&sslkey=/etc/ssl/pgclient/client.key
+
+podSecurityPolicy:
+  enabled: false
+extraVolumes:
+- name: pgclientcrt
+  secret:
+    secretName: pgclientcrt
+    defaultMode: 0440
+- name: pgclientkey
+  secret:
+    secretName: pgclientkey
+    defaultMode: 0440
+- name: pgcacrt
+  secret:
+    secretName: pgcacrt
+    defaultMode: 0440
+
+extraVolumeMounts:
+- name: pgclientcrt
+  mountPath: /etc/ssl/pgclient/client.crt
+  subPath: client.crt
+  readOnly: true
+- name: pgclientkey
+  mountPath: /etc/ssl/pgclient/client.key
+  subPath: client.key
+  readOnly: true
+- name: pgcacrt
+  mountPath: /etc/ssl/pgclient/ca.crt
+  subPath: ca.crt
+  readOnly: true
+

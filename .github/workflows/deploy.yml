@@ -1,0 +1,153 @@
+name: Deploy Teleport cluster on K8s
+#TODO add inputs to set deploy env to support multiple envs
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Render and validate only -- do not install'
+        type: boolean
+        default: false
+concurrency:
+  group: teleport-cluster
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, teleport] # need to check tbot/k8s access path before switching to gh runner
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out this repository onto the runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      
+      - name: Export required variables
+        run: cat gh_vars.env >> "$GITHUB_ENV"
+
+      - name: Check the required vars are set
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_ENV}" ]; then
+            echo "The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV")"
+            exit 1;
+          fi
+
+      - name: Verify Helm config for the region is present
+        run: |
+          set -euo pipefail
+          if [ ! -f "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" ]; then
+            echo "Helm config for the region seems to be missing. Please create the values.yaml file in /[env name]/helm/ "
+            exit 1
+          fi          
+
+      - name: Check the required command-line tools are installed
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in kubectl helm jq openssl envsubst curl base64 tbot; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Not found on this runner's PATH: ${missing[*]}"
+            echo "Re-run runner/install-runner.sh on the runner VM, which installs all of them."
+            echo "(envsubst is part of the 'gettext' package; the others are their own packages.)"
+            echo "::error title=Missing tools on the runner::${missing[*]} -- see runner/install-runner.sh"
+            exit 1
+          fi
+
+          # Print versions: when something behaves oddly later, the first
+          # question is always "which version?", and the answer is now in the log.
+          kubectl version --client
+          helm version
+          echo "jq      $(jq --version)"
+          openssl version
+
+      - name: Run tbot to get kubeconfig
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          envsubst '${RUNNER_TEMP}' < tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
+          tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
+          echo "KUBECONFIG=${RUNNER_TEMP}/machine-id/kubeconfig.yaml" >> "$GITHUB_ENV"
+        
+      - name: Verify access to k8s cluster and resources
+        run: |
+          set -euo pipefail
+          if ! kubectl cluster-info; then
+            echo "Connecting to k8s failed, verify tbot"
+            exit 1
+          fi
+
+          kubectl get ns 
+          kubectl get storageclass
+          if ! kubectl get secret "${TLS_SECRET_NAME}" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+
+
+      - name: Download helm charts
+        run: | 
+          set -euo pipefail
+          helm repo add teleport https://charts.releases.teleport.dev
+          helm repo update
+
+      - name: Helm lint and verify
+        run:
+          set -eou pipefall
+          helm lint chart/teleport-cluster \
+          --values "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
+          --namespace "${K8S_NAMESPACE}"
+
+        #TODO STOP DRYRUN HERE#
+
+      - name: Stop dryrun
+        if: ${{ inputs.dry_run }}
+        run:
+          set -eou pipefall
+          echo "This was a dry run."
+          {
+            echo "## Dry run completed"
+            echo ""
+            echo "All preflight checks passed:"
+            echo "Required software is present;"
+            echo "tbot ran successfully;"
+            echo "K8s access confirmed, required ns and secrets present;"
+            echo "Config is present;"
+            echo "Helm lint successful."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Everything below should check for dry run
+      - name: Install/upgrade Teleport cluster Helm chart   
+        if: ${{ !inputs.dry_run }}    
+        run: |
+          set -euo pipefail
+          helm upgrade --install teleport-cluster teleport/teleport-cluster \
+          --version "${TELEPORT_VERSION}" \
+          --values "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
+          --namespace "${K8S_NAMESPACE}" \
+          --wait \
+          --timeout 15m
+
+      - name: Verify Helm install successful
+        if: ${{ !inputs.dry_run }}    
+        run: |
+          set -euo pipefail
+          helm status teleport-cluster --namespace "${K8S_NAMESPACE}"
+
+      - name: Verify Helm install successful
+        if: ${{ !inputs.dry_run }}    
+        run: |
+          set -euo pipefail
+
+      - name: Verify Helm install successful
+        if: ${{ !inputs.dry_run }}    
+        run: |
+          set -euo pipefail
+
+
+      
+
