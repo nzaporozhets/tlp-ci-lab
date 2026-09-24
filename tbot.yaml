@@ -3,7 +3,7 @@ proxy_server: test02.zap.tams.sh:443
 onboarding:
   join_method: github
   token: github-bot
-certificate_ttl: 5m
+certificate_ttl: 20m
 storage:
   type: memory
 services:
