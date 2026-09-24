@@ -35,7 +35,7 @@ sudo ./install-runner.sh \
 ###g Configuration
 Create a folder under `configs` with the following:
 - `gh_vars.env` with required variables:
-	- `DEPLOY_ENV` should match the config folder name. 
+	- `DEPLOY_ENV` is required for running on push, since no inputs are available to get the value from. Should match the config folder name. 
 	- `K8S_NAMESPACE` to deploy teleport cluster into. Should match the pre-configured NS with secrets;
 	- `TELEPORT_VERSION` to specify the desired cluster version;
 - `teleport-cluster-values.yaml` – Helm values file. [Chart reference.](https://goteleport.com/docs/reference/helm-reference/teleport-cluster/)

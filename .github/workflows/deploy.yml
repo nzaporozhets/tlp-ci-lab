@@ -1,5 +1,4 @@
 name: Deploy Teleport cluster on K8s
-#TODO add inputs to set deploy env to support multiple envs
 on:
   workflow_dispatch:
     inputs:
@@ -7,6 +6,10 @@ on:
         description: 'Render and validate only -- do not install'
         type: boolean
         default: false
+      deploy_env:
+        description: 'Name of the environment to deploy. Should match the directory name in configs/'
+        required: true
+        type: string
 concurrency:
   group: teleport-cluster
   cancel-in-progress: false
@@ -20,21 +23,23 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      DEPLOY_ENV: ${{ inputs.deploy_env }}    
     steps:
       - name: Check out this repository onto the runner
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Export required variables
-        run: cat gh_vars.env >> "$GITHUB_ENV"
+        run: cat "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/gh_vars.env >> "$GITHUB_ENV"
 
-      - name: Check the required vars are set
+      - name: Check that environment for deployment is configured
         run: |
           set -euo pipefail
           if [ -z "${DEPLOY_ENV}" ]; then
-            echo "The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV")"
+            echo "The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV" in the configs/[env name]/gh_vars.yaml if running on push.)"
             exit 1;
           fi
-
+#TODO add env var verification
       - name: Verify Helm config for the region is present
         run: |
           set -euo pipefail
