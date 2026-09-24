@@ -89,9 +89,20 @@ jobs:
             exit 1
           fi
 
-          kubectl get ns 
-          kubectl get storageclass
-          if ! kubectl get secret "${TLS_SECRET_NAME}" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+          if ! kubectl get ns ${K8S_NAMESPACE} -o json | jq .status.phase -r; then
+            echo "Namespace ${K8S_NAMESPACE} doesn't seem to exist is the cluster or you lack permissions to view it"
+            exit 1
+          fi
+
+          if ! kubectl get secret teleport-tls -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+            echo "TLS secret teleport-tls is missing from the ${K8S_NAMESPACE}. Please create it and rerun"
+            exit 1
+          fi
+
+          if ! kubectl get secret teleport-license -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Teleport license secret teleport-license is missing from the ${K8S_NAMESPACE}. Please create it and rerun"
+            exit 1
+          fi
 
 
       - name: Download helm charts
@@ -102,7 +113,7 @@ jobs:
 
       - name: Helm lint and verify
         run:
-          set -eou pipefall
+          set -eou pipefail
           helm lint chart/teleport-cluster \
           --values "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
           --namespace "${K8S_NAMESPACE}"
