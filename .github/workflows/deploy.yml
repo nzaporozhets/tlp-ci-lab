@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Export required variables
-        run: cat "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/gh_vars.env >> "$GITHUB_ENV"
+        run: cat "${RUNNER_TEMP}/configs/${DEPLOY_ENV}/gh_vars.env" >> "$GITHUB_ENV"
 
       - name: Check that environment for deployment is configured
         run: |
