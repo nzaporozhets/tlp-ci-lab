@@ -11,7 +11,7 @@ highAvailability:
 # Teleport Community Edition.
 enterprise: true                                  
 # If you are running Kubernetes 1.23 or above, disable PodSecurityPolicies
-licenseSecretName: "license" 
+licenseSecretName: "teleport-license" 
 tls:
   existingSecretName: "teleport-tls" 
 
