@@ -27,6 +27,8 @@ auth:
         type: postgresql
         conn_string: postgresql://teleport-pg@pgbackend.zap.tams.sh:5432/teleport_backend?sslmode=verify-full&sslrootcert=/etc/ssl/pgclient/ca.crt&sslcert=/etc/ssl/pgclient/client.crt&sslkey=/etc/ssl/pgclient/client.key
         audit_events_uri: postgresql://teleport-pg@pgbackend.zap.tams.sh:5432/teleport_audit?sslmode=verify-full&sslrootcert=/etc/ssl/pgclient/ca.crt&sslcert=/etc/ssl/pgclient/client.crt&sslkey=/etc/ssl/pgclient/client.key
+        region: us-west-1
+        audit_sessions_uri: s3://nikita-certlab-sessions
 
 podSecurityPolicy:
   enabled: false
