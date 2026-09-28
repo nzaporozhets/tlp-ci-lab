@@ -70,6 +70,8 @@
 #    Needed by this installer only, at install time:
 #      dl.k8s.io, cdn.dl.k8s.io          pinned kubectl binary + checksum
 #      get.helm.sh                       pinned helm archive + checksum
+#      github.com (release download)     pinned yq binary (redirects to
+#                                        release-assets.githubusercontent.com)
 #      your distro's package mirrors     curl, tar, git, jq, openssl, gettext
 #
 #  Outbound SMTP, SSH to GitHub, or anything else: not required.
@@ -142,6 +144,11 @@ set -euo pipefail
 #
 #   kubectl  https://dl.k8s.io/release/<ver>/bin/linux/<arch>/kubectl.sha256
 #   helm     https://get.helm.sh/helm-<ver>-linux-<arch>.tar.gz.sha256sum
+#   yq       the release page at
+#            https://github.com/mikefarah/yq/releases/tag/<ver>
+#            (each asset is listed with its SHA-256), or, scriptably:
+#            curl -s https://api.github.com/repos/mikefarah/yq/releases/tags/<ver> \
+#              | jq -r '.assets[] | select(.name|test("^yq_linux_(amd64|arm64)$")) | "\(.name) \(.digest)"'
 #   runner   the release notes at
 #            https://github.com/actions/runner/releases/tag/<ver>
 #            (each asset is listed with its SHA-256), or, scriptably:
@@ -168,6 +175,15 @@ readonly KUBECTL_SHA256_ARM64="922df28df248cc00a9e025f947704f1d1482de64ece54cfe5
 readonly HELM_VERSION="v3.22.0"
 readonly HELM_SHA256_AMD64="1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb"
 readonly HELM_SHA256_ARM64="f14e804dfee240f55525b667488fe9adca349e63e00c9af634c0beb1421ac310"
+
+# yq -- mikefarah's Go YAML processor (v4), used by the deploy workflow to read
+# values out of the Helm values file (e.g. clusterName). Installed from the
+# upstream release, NOT the distro package: on Debian/Ubuntu the `yq` package is
+# a different, Python-based tool with incompatible syntax. The hashes are for
+# the raw `yq_linux_<arch>` binaries (not the .tar.gz archives).
+readonly YQ_VERSION="v4.53.6"
+readonly YQ_SHA256_AMD64="c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385"
+readonly YQ_SHA256_ARM64="88a1016bc1d657375a35864e4f44b6f333df8ff97b559f51bba0adcb2169df09"
 
 # actions/runner -- the agent itself. GitHub auto-updates the runner in place
 # after registration, so this pin is only the starting point.
@@ -707,12 +723,47 @@ install_helm() {
   log "Installed ${BIN_DIR}/helm"
 }
 
+install_yq() {
+  section "Step 3/8 (c): yq ${YQ_VERSION}"
+
+  # `yq --version` prints e.g. "yq (https://github.com/mikefarah/yq/) version v4.53.6".
+  # Matching on "mikefarah" as well guards against the unrelated Python yq.
+  if [[ -x "${BIN_DIR}/yq" ]] \
+     && "${BIN_DIR}/yq" --version 2>/dev/null | grep -q "mikefarah.*version ${YQ_VERSION}$"; then
+    log "yq ${YQ_VERSION} is already installed at ${BIN_DIR}/yq -- skipping."
+    return 0
+  fi
+
+  local expected
+  case "$ARCH_GO" in
+    amd64) expected="$YQ_SHA256_AMD64" ;;
+    arm64) expected="$YQ_SHA256_ARM64" ;;
+    *)     die "internal error: unexpected ARCH_GO='${ARCH_GO}'" ;;
+  esac
+
+  local tmp="${WORK_DIR}/yq"
+  download "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH_GO}" "$tmp"
+  verify_sha256 "$tmp" "$expected" "yq ${YQ_VERSION} (linux/${ARCH_GO})"
+
+  install -o root -g root -m 0755 "$tmp" "${BIN_DIR}/yq"
+  log "Installed ${BIN_DIR}/yq"
+
+  # /usr/local/bin usually comes before /usr/bin on PATH, but warn if some other
+  # yq (e.g. the Python one from apt) would still win for the runner.
+  local resolved
+  resolved="$(command -v yq || true)"
+  if [[ "$resolved" != "${BIN_DIR}/yq" ]]; then
+    warn "'yq' on PATH resolves to '${resolved}', not ${BIN_DIR}/yq. Remove the other yq or fix PATH, or workflows will use the wrong tool."
+  fi
+}
+
 # Print what we ended up with. The deploy workflow's preflight will print these
 # too, but seeing them here confirms the install before you go near GitHub.
 print_tool_versions() {
-  section "Step 3/8 (c): installed tool versions"
+  section "Step 3/8 (d): installed tool versions"
   log "kubectl: $("${BIN_DIR}/kubectl" version --client=true -o yaml 2>/dev/null | awk '/gitVersion/ {print $2; exit}')"
   log "helm:    $("${BIN_DIR}/helm" version --short 2>/dev/null)"
+  log "yq:      $("${BIN_DIR}/yq" --version 2>/dev/null)"
   log "git:     $(git --version)"
   log "jq:      $(jq --version)"
   log "openssl: $(openssl version)"
@@ -1022,6 +1073,7 @@ print_summary() {
   Start at boot    : ${service_enabled}
   kubectl          : ${BIN_DIR}/kubectl ($("${BIN_DIR}/kubectl" version --client=true -o yaml 2>/dev/null | awk '/gitVersion/ {print $2; exit}'))
   helm             : ${BIN_DIR}/helm ($("${BIN_DIR}/helm" version --short 2>/dev/null))
+  yq               : ${BIN_DIR}/yq ($("${BIN_DIR}/yq" --version 2>/dev/null | awk '{print $NF}'))
 
   The runner should now appear as "Idle" at:
     ${ARG_URL%/}/settings/actions/runners
@@ -1110,6 +1162,7 @@ main() {
 
   install_kubectl
   install_helm
+  install_yq
   print_tool_versions
 
   create_runner_user
