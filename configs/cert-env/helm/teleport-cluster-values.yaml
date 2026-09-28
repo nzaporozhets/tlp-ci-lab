@@ -15,6 +15,9 @@ licenseSecretName: "teleport-license"
 tls:
   existingSecretName: "teleport-tls" 
 
+labels:
+  gha_tbot_managed: true
+
 acme: false
 
 persistence:

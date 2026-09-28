@@ -32,12 +32,16 @@ sudo ./install-runner.sh \
   --token  <registration-token> \
   --labels self-hosted,linux,teleport
 ```
-###g Configuration
+### Configuration
 Create a folder under `configs` with the following:
 - `gh_vars.env` with required variables:
 	- `DEPLOY_ENV` is required for running on push, since no inputs are available to get the value from. Should match the config folder name. 
 	- `K8S_NAMESPACE` to deploy teleport cluster into. Should match the pre-configured NS with secrets;
 	- `TELEPORT_VERSION` to specify the desired cluster version;
-- `/helm/teleport-cluster-values.yaml` – Helm values file. [Chart reference.](https://goteleport.com/docs/reference/helm-reference/teleport-cluster/)
-Create a tbot.yaml file in the repo root with a tbot config. `tbot` [config reference](https://goteleport.com/docs/reference/machine-workload-identity/configuration/).
+- `/helm/teleport-cluster-values.yaml` – Helm values file. [Chart reference.](https://goteleport.com/docs/reference/helm-reference/teleport-cluster/) Note: if you wish to use MWI pipeline, values need to containg the following label, which will be used to configure Teleport K8S cluster access:
+	```yaml
+	labels:
+	  gha_tbot_managed: true
+	```
+- Create a tbot.yaml file in the repo root with a tbot config. `tbot` [config reference](https://goteleport.com/docs/reference/machine-workload-identity/configuration/).
 Lint runs on push, deploy is currently limited to manual runs due to self-hosted runner usage. 
