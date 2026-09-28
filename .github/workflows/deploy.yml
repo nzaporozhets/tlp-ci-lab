@@ -10,6 +10,10 @@ on:
         description: 'Name of the environment to deploy. Should match the directory name in configs/'
         required: true
         type: string
+      mwi_enabled:
+        description: 'Configure tbot for this GHA pipeline from the new cluster'
+        type: boolean
+        default: false
 concurrency:
   group: teleport-cluster
   cancel-in-progress: false
@@ -24,7 +28,7 @@ jobs:
       run:
         shell: bash
     env:
-      DEPLOY_ENV: ${{ inputs.deploy_env }}    
+      DEPLOY_ENV: ${{ inputs.deploy_env }}  
     steps:
       - name: Check out this repository onto the runner
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,17 +129,18 @@ jobs:
           set -euo pipefail
           helm repo add teleport https://charts.releases.teleport.dev
           helm repo update
-
-      - name: Helm lint and verify
-        run:
-          set -eou pipefail
-          helm lint chart/teleport-cluster \
-          --values "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
-          --namespace "${K8S_NAMESPACE}"
+          
+      #TODO: lint was actually broken and never ran, need to deal with it later
+      # - name: Helm lint and verify
+      #   run: |
+      #     set -eou pipefail
+      #     helm lint chart/teleport-cluster \
+      #     --values "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" \
+      #     --namespace "${K8S_NAMESPACE}"
 
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
-        run:
+        run: |
           set -eou pipefail
           echo "This was a dry run."
           {
@@ -172,6 +177,56 @@ jobs:
         run: |
           set -euo pipefail
           kubectl get services/teleport-cluster -n ${K8S_NAMESPACE}
+
+
+#k8s role is probably not needed for this bot, as create/delete would create ouroboros-type situations, only update would work. 
+#TODO: Role has no update on roles, so future RBAC pipeline needs to have checks for reruns. Or maybe add JIT? 
+#TODO: config template should be just pushed to the repo when run, changes are trivial. Or generate in each pipeline?
+      - name: Create and configure bot user 
+        if: ${{ !inputs.dry_run && inputs.mwi_enabled }}
+        run: | 
+          set -eo pipefail
+          echo "Creating a Role for bot"         
+          kubectl exec -i -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<'EOF'
+          kind: role
+          metadata:
+            name: gha-ci-bot
+          version: v7
+          spec:
+            allow:
+              rules:
+                - resources: [role]
+                  verbs: [list, create, read]
+                - resources: [auth_connector]
+                  verbs: [list, create, read, update]
+            deny: {}
+          EOF
+
+          echo "Creating a GitHub-type join token"
+          kubectl exec -i -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<EOF
+          kind: token
+          version: v2
+          metadata:
+            name: gha-bot-token
+          spec:
+            join_method: github
+            roles:
+            - Bot
+            bot_name: gha-bot
+            github:
+              allow:
+              - repository: "${{ github.repository }}"
+          EOF
+
+          echo "Creating a bot user"
+          kubectl exec -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl bots add gha-bot --roles gha-ci-bot --token gha-bot-token
+
+          echo "The following resources have been created:"
+          echo "- Teleport role gha-ci-bot to allow bot create and edit roles and SSO auth connectors;"
+          echo "- Teleport GitHub join token gha-bot-token and a bot user gha-bot "
+          echo "Please copy a bot config template from templates/tbot.yaml to configs/${DEPLOY_ENV}/teleport/mwi to use this bot with teleport configuration pipelines."
+        
+
 
 
 

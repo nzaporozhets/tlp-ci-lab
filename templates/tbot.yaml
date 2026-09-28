@@ -1,0 +1,14 @@
+version: v2
+proxy_server: [your cluster name]:443
+onboarding:
+  join_method: github
+  token: gha-bot-token
+certificate_ttl: 20m
+storage:
+  type: memory
+services:
+  - type: identity
+    destination:
+      type: directory
+
+      path: "${RUNNER_TEMP}/machine-id"
