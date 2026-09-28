@@ -219,7 +219,7 @@ jobs:
           EOF
 
           echo "Creating a bot user"
-          kubectl exec -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<EOF
+          kubectl exec -i -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<EOF
           kind: bot
           version: v1
           metadata:
