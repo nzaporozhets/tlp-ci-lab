@@ -186,7 +186,7 @@ jobs:
         if: ${{ !inputs.dry_run && inputs.mwi_enabled }}
         run: | 
           set -eo pipefail
-          echo "Creating a Role for bot"         
+          echo "Creating a Role for bot..."
           kubectl exec -i -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<'EOF'
           kind: role
           metadata:
@@ -202,7 +202,7 @@ jobs:
             deny: {}
           EOF
 
-          echo "Creating a GitHub-type join token"
+          echo "Creating a GitHub-type join token..."
           kubectl exec -i -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<EOF
           kind: token
           version: v2
@@ -218,7 +218,7 @@ jobs:
               - repository: "${{ github.repository }}"
           EOF
 
-          echo "Creating a bot user"
+          echo "Creating a bot user..."
           kubectl exec -i -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<EOF
           kind: bot
           version: v1
@@ -228,10 +228,6 @@ jobs:
             roles:
               - gha-ci-bot
           EOF
-
-          echo "The following resources have been created:"
-          echo "- Teleport role gha-ci-bot to allow bot create and edit roles and SSO auth connectors;"
-          echo "- Teleport GitHub join token gha-bot-token and a bot user gha-bot "
           echo "Please copy a bot config template from templates/tbot.yaml to configs/${DEPLOY_ENV}/teleport/mwi to use this bot with teleport configuration pipelines."
         
 
