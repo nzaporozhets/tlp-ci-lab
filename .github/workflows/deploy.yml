@@ -129,7 +129,7 @@ jobs:
           set -euo pipefail
           helm repo add teleport https://charts.releases.teleport.dev
           helm repo update
-          
+
       #TODO: lint was actually broken and never ran, need to deal with it later
       # - name: Helm lint and verify
       #   run: |
@@ -219,7 +219,15 @@ jobs:
           EOF
 
           echo "Creating a bot user"
-          kubectl exec -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl bots add gha-bot --roles gha-ci-bot --token gha-bot-token
+          kubectl exec -n "${K8S_NAMESPACE}" deploy/teleport-cluster-auth -- tctl create -f - <<EOF
+          kind: bot
+          version: v1
+          metadata:
+            name: gha-bot
+          spec:
+            roles:
+              - gha-ci-bot
+          EOF
 
           echo "The following resources have been created:"
           echo "- Teleport role gha-ci-bot to allow bot create and edit roles and SSO auth connectors;"
