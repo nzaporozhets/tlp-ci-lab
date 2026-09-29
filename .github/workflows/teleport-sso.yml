@@ -30,6 +30,7 @@ jobs:
         shell: bash
     env:
       DEPLOY_ENV: ${{ inputs.deploy_env }}    
+      MWI_SUPPLIED: false
     steps:
       - name: Require MWI confirmation
         if: ${{ !inputs.mwi_configured }}
