@@ -194,7 +194,7 @@ jobs:
           files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/sso/"*connector.yaml)
           for f in "${files[@]}"; do
             echo "Attempting to create connector $f"
-            if ! tctl create -f "$f" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
+            if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
               if grep -qi "access denied" err.log; then
                 echo "::error::Bot lacks permission to create/update the auth connector. Grant the bot's role 'create,update' on resource 'auth_connector' (or the specific 'github'/'saml'/'oidc' kind)."
               fi
