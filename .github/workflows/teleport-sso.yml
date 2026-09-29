@@ -188,6 +188,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
 #tctl shouldn't need a config here, but my runner was discovered by my other cluster. Trying to point to an empty file...
+
+      - name: Fake config instead of auto-discovered from other cluster
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -eo pipefail
+          touch "${RUNNER_TEMP}/fake_empty_cfg"
+
       - name: Apply SSO connector(s)
         if: ${{ !inputs.dry_run }}
         run: |
