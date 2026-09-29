@@ -117,9 +117,11 @@ jobs:
           if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml" ]; then
             echo "User-supplied MWI config is not found. Will attempt to generate based on the default deploy workflow values."
             echo "::warning::Config generation only works if the cluster deployment workflow had TBot configuration enabled."
-            echo "MWI_SUPPLIED=false" >> "$GITHUB_ENV"            
+            echo "MWI_SUPPLIED=false" >> "$GITHUB_ENV"    
+          else 
+            echo "Found MWI config at ${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml , will attempt to use it."
+            echo "MWI_SUPPLIED=true" >> "$GITHUB_ENV"  
           fi  
-
 
       - name: Generate tbot config if not supplied by user
         if: ${{ !env.MWI_SUPPLIED }}
@@ -192,7 +194,7 @@ jobs:
           files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/sso/"*connector.yaml)
           for f in "${files[@]}"; do
             echo "Attempting to create connector $f"
-            if ! tctl create -f "$f" --auth-server="${CLUSTER_NAME}" 2>err.log; then
+            if ! tctl create -f "$f" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
               if grep -qi "access denied" err.log; then
                 echo "::error::Bot lacks permission to create/update the auth connector. Grant the bot's role 'create,update' on resource 'auth_connector' (or the specific 'github'/'saml'/'oidc' kind)."
               fi
