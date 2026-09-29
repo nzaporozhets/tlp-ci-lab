@@ -149,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           # shellcheck disable=SC2016
-          envsubst '${RUNNER_TEMP}' < configs/${DEPLOY_ENV}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
+          envsubst '${RUNNER_TEMP}' < configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
           tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
           echo "TELEPORT_KEY_AGENT_DIR=${RUNNER_TEMP}/machine-id/" >> "$GITHUB_ENV"
           echo "TELEPORT_IDENTITY_FILE=${RUNNER_TEMP}/machine-id/identity" >> "$GITHUB_ENV"
