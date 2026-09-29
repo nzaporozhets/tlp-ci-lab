@@ -30,7 +30,7 @@ jobs:
         shell: bash
     env:
       DEPLOY_ENV: ${{ inputs.deploy_env }}    
-      MWI_SUPPLIED: false
+      MWI_SUPPLIED: ""
     steps:
       - name: Require MWI confirmation
         if: ${{ !inputs.mwi_configured }}
@@ -122,7 +122,7 @@ jobs:
 
 
       - name: Generate tbot config if not supplied by user
-        if: ${{ !MWI_SUPPLIED }}
+        if: ${{ !env.MWI_SUPPLIED }}
         run: |
           set -euo pipefail
           cat <<EOF > "${RUNNER_TEMP}/tbot.yaml"
@@ -143,7 +143,7 @@ jobs:
           EOF
 
       - name: Run tbot to get machine id (user-suplied config)
-        if: ${{ MWI_SUPPLIED }}
+        if: ${{ env.MWI_SUPPLIED }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2016
@@ -153,7 +153,7 @@ jobs:
           echo "TELEPORT_IDENTITY_FILE=${RUNNER_TEMP}/machine-id/identity" >> "$GITHUB_ENV"
 
       - name: Run tbot to get machine id (generated config)
-        if: ${{ !MWI_SUPPLIED }}
+        if: ${{ !env.MWI_SUPPLIED }}
         run: |
           set -euo pipefail
           tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
