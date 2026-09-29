@@ -1,0 +1,24 @@
+kind: saml
+metadata:
+  name: okta
+spec:
+  acs: https://certlab.zap.tams.sh/v1/webapi/saml/acs/okta
+  attributes_to_roles:
+  - name: groups
+    roles:
+    - auditor
+    - editor
+    value: admins
+  - name: groups
+    roles:
+    - access
+    value: members
+  audience: https://certlab.zap.tams.sh/v1/webapi/saml/acs/okta
+  cert: ""
+  display: Okta
+  entity_descriptor: ""
+  entity_descriptor_url: https://integrator-7230203.okta.com/app/exk186f4y2jD1n2gv698/sso/saml/metadata
+  issuer: ""
+  service_provider_issuer: https://certlab.zap.tams.sh/v1/webapi/saml/acs/okta
+  sso: ""
+version: v2
