@@ -106,9 +106,9 @@ jobs:
       - name: Verify at least one connector config for the environment is present
         run: |
           set -euo pipefail
-          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/sso/*"connector.yaml)
+          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/sso/"*connector.yaml)
           if [ ! -f "${files[0]}" ]; then
-            echo "::error::SSO config for the environment seems to be missing. Please create the [SSO serivece]-connector.yaml file in /[env name]/teleport/sso/ "
+            echo "::error::SSO config for the environment seems to be missing. Please create the [SSO serivece]-connector.yaml file in configs/[env name]/teleport/sso/ "
             exit 1
           fi
       - name: Check for supplied MWI config
