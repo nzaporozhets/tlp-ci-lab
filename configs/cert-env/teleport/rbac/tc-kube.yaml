@@ -1,0 +1,38 @@
+kind: role
+metadata:
+  description: 'RBAC Kube Access role for Technical Certification. Notes: uses a lookup
+    table regexp to match department to ns, login rules would''ve been optimal here.'
+  name: tc-kube
+spec:
+  allow:
+    kubernetes_groups:
+    - viewers
+    kubernetes_labels:
+      '*': '*'
+    kubernetes_resources:
+    - kind: '*'
+      name: '*'
+      namespace: '{{regexp.replace(external.department, "^prof-srv$", "tc-ns")}}'
+      verbs:
+      - '*'
+  deny: {}
+  options:
+    cert_format: standard
+    create_db_user: false
+    create_desktop_user: false
+    desktop_clipboard: true
+    desktop_directory_sharing: true
+    enhanced_recording:
+    - command
+    - network
+    forward_agent: false
+    idp:
+      saml:
+        enabled: true
+    max_session_ttl: 30h0m0s
+    pin_source_ip: false
+    record_session:
+      default: best_effort
+      desktop: true
+    ssh_file_copy: true
+version: v7

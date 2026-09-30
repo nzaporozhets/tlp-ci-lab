@@ -1,0 +1,219 @@
+name: Configure Teleport RBAC
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Render and validate only -- do not install'
+        type: boolean
+        default: false
+      deploy_env:
+        description: 'Name of the environment to configure. Should match the directory name in configs/'
+        required: true
+        type: string
+      mwi_configured:
+      #TODO no cross-workflow dependencies in GHA, currently an "honor" system. Can be refactored to API workflow status check.
+        description: "I confirm that cluster deploy job was set to configure MWI and ran successfully OR I have supplied my own MWI config as configs/[env name]/mwi/tbot.yaml"
+        type: boolean
+        required: true
+concurrency:
+  group: teleport-configs
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  configure_rbac:
+    runs-on: [self-hosted, linux, teleport] # need to check tbot/k8s access path before switching to gh runner
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEPLOY_ENV: ${{ inputs.deploy_env }}    
+      MWI_SUPPLIED: ""
+    steps:
+      - name: Require MWI confirmation
+        if: ${{ !inputs.mwi_configured }}
+        run: echo "::error::Confirm MWI is configured – can't connect to your Teleport cluster without identity souce"; exit 1
+
+      - name: Check out this repository onto the runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      
+      - name: Export required variables
+        run: cat "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/gh_vars.env" >> "$GITHUB_ENV"
+
+      - name: Check the required command-line tools are installed
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in jq openssl envsubst curl base64 tbot tctl tsh yq; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Not found on this runner's PATH: ${missing[*]}"
+            echo "Re-run runner/install-runner.sh on the runner VM, which installs all of them."
+            echo "(envsubst is part of the 'gettext' package; the others are their own packages.)"
+            echo "::error title=Missing tools on the runner::${missing[*]} -- see runner/install-runner.sh"
+            exit 1
+          fi
+
+          # Print versions: when something behaves oddly later, the first
+          # question is always "which version?", and the answer is now in the log.
+          kubectl version --client
+          helm version
+          echo "jq      $(jq --version)"
+          openssl version
+
+      - name: Check that environment for deployment is configured
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_ENV}" ]; then
+            echo "::error::The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV" in the configs/[env name]/gh_vars.yaml if running on push.)"
+            exit 1;
+          fi
+
+      - name: Read Teleport cluster name from Helm values
+        run: |
+          set -euo pipefail
+          values="${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml"
+          cluster_name=$(yq -e '.clusterName' "${values}")
+          if [[ -z "${cluster_name}" ]]; then
+            echo "::error::clusterName is empty in ${values}"
+            exit 1
+          fi
+          echo "CLUSTER_NAME=${cluster_name}" >> "$GITHUB_ENV"
+          echo "cluster_name=${cluster_name}" >> "$GITHUB_OUTPUT"
+          echo "Teleport cluster name: ${cluster_name}"
+
+      - name: Check the required env variables are set
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in TELEPORT_VERSION K8S_NAMESPACE ; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::These env variables are empty or not set: ${missing[*]}. Add to the configs/${DEPLOY_ENV}/gh_vars.yaml"
+            exit 1
+          fi
+
+      - name: Verify at least one RBAC yaml config for the environment is present
+        run: |
+          set -euo pipefail
+          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
+          if [ ! -f "${files[0]}" ]; then
+            echo "::error::No yaml files have been found under configs/${DEPLOY_ENV}/teleport/rbac/. Please upload your Role or Access List yaml files."
+            exit 1
+          fi
+      - name: Check for supplied MWI config
+        run: |
+          set -euo pipefail 
+          if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml" ]; then
+            echo "User-supplied MWI config is not found. Will attempt to generate based on the default deploy workflow values."
+            echo "::warning::Config generation only works if the cluster deployment workflow had TBot configuration enabled."
+            echo "MWI_SUPPLIED=false" >> "$GITHUB_ENV"    
+          else 
+            echo "Found MWI config at ${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml , will attempt to use it."
+            echo "MWI_SUPPLIED=true" >> "$GITHUB_ENV"  
+          fi  
+
+      - name: Generate tbot config if not supplied by user
+        if: ${{ !env.MWI_SUPPLIED }}
+        run: |
+          set -euo pipefail
+          cat <<EOF > "${RUNNER_TEMP}/tbot.yaml"
+          version: v2
+          proxy_server: "${CLUSTER_NAME}:443"
+          onboarding:
+            join_method: github
+            token: gha-bot-token
+          certificate_ttl: 20m
+          storage:
+            type: memory
+          services:
+            - type: identity
+              destination:
+                type: directory
+
+                path: "${RUNNER_TEMP}/machine-id"
+          EOF
+
+      - name: Run tbot to get machine id (user-suplied config)
+        if: ${{ env.MWI_SUPPLIED }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          envsubst '${RUNNER_TEMP}' < configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml > "${RUNNER_TEMP}/tbot.yaml"
+          tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
+          echo "TELEPORT_KEY_AGENT_DIR=${RUNNER_TEMP}/machine-id/" >> "$GITHUB_ENV"
+          echo "TELEPORT_IDENTITY_FILE=${RUNNER_TEMP}/machine-id/identity" >> "$GITHUB_ENV"
+
+      - name: Run tbot to get machine id (generated config)
+        if: ${{ !env.MWI_SUPPLIED }}
+        run: |
+          set -euo pipefail
+          tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
+          echo "TELEPORT_KEY_AGENT_DIR=${RUNNER_TEMP}/machine-id/" >> "$GITHUB_ENV"
+          echo "TELEPORT_IDENTITY_FILE=${RUNNER_TEMP}/machine-id/identity" >> "$GITHUB_ENV"
+
+      - name: Verify mID access to the Teleport cluster
+        run: | 
+          set -euo pipefail
+          if ! tsh status --proxy="${CLUSTER_NAME}"; then
+            echo "::error::No access to Teleport cluster. Verify tbot status."
+            echo "Key agent dir: ${TELEPORT_KEY_AGENT_DIR}"
+            echo "Identity file: ${TELEPORT_IDENTITY_FILE}"
+            exit 1
+          fi
+#by default, the bot's role doesn't allow 'update' on roles to prevent privilege escalations on own role. Need to test if safe to enable/add modified files check
+      - name: Stop dryrun
+        if: ${{ inputs.dry_run }}
+        run: |
+          set -eou pipefail
+          echo "This was a dry run."
+          {
+            echo "## Dry run completed"
+            echo ""
+            echo "All preflight checks passed:"
+            echo "Required software is present;"
+            echo "tbot ran successfully;"
+            echo "MWI access confirmed;"
+            echo "Config is present;"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply RBAC file(s)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -eo pipefail
+          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
+          for f in "${files[@]}"; do
+            echo "Attempting to create connector $f"
+            if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
+              if grep -qi "access denied" err.log; then
+                echo "::error::Bot lacks permission to create the resource. Grant the bot's role 'create' on resource 'role'."
+              fi
+              cat err.log
+              exit 1
+            fi
+          done
+
+
+      - name: some next step
+        if: ${{ !inputs.dry_run }}
+        run: | 
+          set -euo pipefail
+
+      - name: some next step
+        if: ${{ !inputs.dry_run }}
+        run: | 
+          set -euo pipefail
+
+
+      
+
