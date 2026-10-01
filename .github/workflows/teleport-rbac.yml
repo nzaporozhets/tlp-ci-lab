@@ -173,6 +173,7 @@ jobs:
             exit 1
           fi
 
+#TODO we're not currently checking for wildcards, which we should
       - name: Check if runner roles have 'update' on 'role'
         run: | 
           set -euo pipefail
@@ -181,7 +182,7 @@ jobs:
           for runner_role in "${roles[@]}"; do
             echo "Found runner roles: ${runner_role}. Checking if runner has 'update' permission on the 'role' resource."
             role_json=$(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443) 
-            allow= $(jq -r '.[0].spec.allow.rules[] | select(.resources[0]=="role").verbs | index("update") //empty' <<< ${role_json})
+            allow= $(jq -r '.[0].spec.allow.rules[] | select(.resources[0]=="role").verbs | index("update") //empty' <<< ${role_json}) 
             deny=$(jq -r '.[0].spec.deny.rules[]? | select(.resources[0]=="role").verbs | index("update") //empty' <<< ${role_json})
             if [[ ${deny} ]]; then
               echo "Found explicit deny for 'update' the 'role' resource in ${runner_role}."
@@ -193,6 +194,9 @@ jobs:
               echo "RUNNER_HAS_UPDATE=true" >> "$GITHUB_ENV"
             fi
           done
+          if ! ${RUNNER_HAS_UPDATE}; then
+            echo "No active roles have 'update' on 'role' set. Runner can not update existing roles."
+          fi
 
 
 #Only required if the user chose to grant `update` on `role`. TODO: add multidoc file test.
