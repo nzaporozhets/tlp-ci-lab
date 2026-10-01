@@ -172,6 +172,7 @@ jobs:
             exit 1
           fi
 
+#Only required if the user chose to grant `update` on `role`. TODO: add multidoc file test.
       - name: Verify runner roles against supplied configs
         run: | 
           set -euo pipefail
@@ -189,7 +190,7 @@ jobs:
               fi
             done
           done
-#by default, the bot's role doesn't allow 'update' on roles to prevent privilege escalations on own role. Need to test if safe to enable/add modified files check
+
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
         run: |
@@ -205,6 +206,7 @@ jobs:
             echo "Config is present;"
           } >> "$GITHUB_STEP_SUMMARY"
 
+#Pipeline-generated role for bot doesn't allow 'update' on roles to prevent privilege escalations on own role. 
       - name: Apply RBAC file(s)
         if: ${{ !inputs.dry_run }}
         run: |
