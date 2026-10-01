@@ -1,0 +1,31 @@
+kind: role
+metadata:
+  description: fake role to test pipeline checks
+  name: gha-ci-bot
+spec:
+  allow:
+    logins:
+    - ubuntu
+    - ec2-user
+    node_labels:
+      '*': '*'
+  deny:
+    logins:
+    - root
+  options:
+    cert_format: standard
+    create_db_user: false
+    create_desktop_user: false
+    desktop_clipboard: true
+    desktop_directory_sharing: true
+    enhanced_recording:
+    - command
+    - network
+    forward_agent: false
+    max_session_ttl: 30h0m0s
+    pin_source_ip: false
+    record_session:
+      default: best_effort
+      desktop: true
+    ssh_file_copy: true
+version: v8
