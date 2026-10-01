@@ -32,7 +32,7 @@ sudo ./install-runner.sh \
   --token  <registration-token> \
   --labels self-hosted,linux,teleport
 ```
-### Configuration
+### Configuration – Teleport cluster
 Create a folder under `configs` with the following:
 - `gh_vars.env` with required variables:
 	- `DEPLOY_ENV` is required for running on push, since no inputs are available to get the value from. Should match the config folder name. 
@@ -45,3 +45,17 @@ Create a folder under `configs` with the following:
 	```
 - Create a tbot.yaml file in the repo root with a tbot config. `tbot` [config reference](https://goteleport.com/docs/reference/machine-workload-identity/configuration/).
 Lint runs on push, deploy is currently limited to manual runs due to self-hosted runner usage. 
+
+#### MWI configuration options
+If you wish to use this pipeline to further configure your newly deployed Teleport cluster, you'll need to configure `tbot` for access. This can be done either by ticking a `Configure tbot for this GHA pipeline from the new cluster` checkbox, or by configuring your own role and bot user and supplying the `tbot.yaml` config in the `configs/[env name]/teleport/mwi` folder. 
+
+If you proceed with a pipeline-configurated tbot, Deploy Cluster workflow will:
+- Create a Role `gha-ci-bot` for bot with `create`, `list`, `read` permissions on `role` resources and `create`, `update`, `list`,  `read` permissions on `auth_connector` resources;
+- Create a GitHub-type Join Token `gha-bot-token` for the repository;
+- Create a bot user `gha-bot` with the Role and Join Token.
+SSO and RBAC pipelines will automatically check if the user-provided `tbot.yaml` config is present and use it, if not – the config is generated for each run based on automatically created role and bot user. 
+> Note: Default bot role specifically omits `update` on the `role` resource to prevent potential privilege escalation through modifying own role. This means the pipeline by default can not make changes to the Role resources, only create new ones. 
+### Configuring Teleport SSO connectors
+To use this workflow, add at least one Teleport SSO connector configuration file to `configs/[env name]/teleport/sso`. This workflow requiures MWI to be configured. 
+### Configuring Teleport RBAC
+To use this workflow, add at least one Teleport RBAC yaml configuration file to `configs/[env name]/teleport/rbac`. This workflow requiures MWI to be configured.
