@@ -196,7 +196,13 @@ jobs:
             echo "Attempting to create connector $f"
             if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
               if grep -qi "access denied" err.log; then
-                echo "::error::Bot lacks permission to create the resource. Grant the bot's role 'create' on resource 'role'."
+                action=$(sed -nE 's/.*access denied to perform action "([^"]+)" on "([^"]+)".*/\1/Ip' err.log | head -n1)
+                resource=$(sed -nE 's/.*access denied to perform action "([^"]+)" on "([^"]+)".*/\2/Ip' err.log | head -n1)
+                if [[ ${action} == "update" && ${resource} == role ]]; then
+                  echo "::error:: Config file $f appears to make an update on existing role(s). Bot lacks permission to update roles. This is an intentional design choice to prevent permission escalation. If you understand the risks, you can grant the bot's role 'update' on 'roles'."
+                else
+                  echo "::error::Bot lacks permission '${action}' for the resource '${resource}''. Grant the bot's role '${action}' on resource '${resource}'."
+                fi
               fi
               cat err.log
               exit 1
