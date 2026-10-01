@@ -117,7 +117,7 @@ jobs:
           if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml" ]; then
             echo "User-supplied MWI config is not found. Will attempt to generate based on the default deploy workflow values."
             echo "::warning::Config generation only works if the cluster deployment workflow had TBot configuration enabled."
-            echo "MWI_SUPPLIED=false" >> "$GITHUB_ENV"    
+            echo "MWI_SUPPLIED=" >> "$GITHUB_ENV"    
           else 
             echo "Found MWI config at ${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml , will attempt to use it."
             echo "MWI_SUPPLIED=true" >> "$GITHUB_ENV"  

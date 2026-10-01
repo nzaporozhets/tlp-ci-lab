@@ -31,6 +31,7 @@ jobs:
     env:
       DEPLOY_ENV: ${{ inputs.deploy_env }}    
       MWI_SUPPLIED: ""
+      RUNNER_HAS_UPDATE: ""
     steps:
       - name: Require MWI confirmation
         if: ${{ !inputs.mwi_configured }}
@@ -117,7 +118,7 @@ jobs:
           if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml" ]; then
             echo "User-supplied MWI config is not found. Will attempt to generate based on the default deploy workflow values."
             echo "::warning::Config generation only works if the cluster deployment workflow had TBot configuration enabled."
-            echo "MWI_SUPPLIED=false" >> "$GITHUB_ENV"    
+            echo "MWI_SUPPLIED=" >> "$GITHUB_ENV"    
           else 
             echo "Found MWI config at ${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/mwi/tbot.yaml , will attempt to use it."
             echo "MWI_SUPPLIED=true" >> "$GITHUB_ENV"  
@@ -172,6 +173,27 @@ jobs:
             exit 1
           fi
 
+      - name: Check if runner roles have 'update' on 'role'
+        run: | 
+          set -euo pipefail
+          roles=($(tsh status --proxy="${CLUSTER_NAME}" -f json | jq -r '.active.roles[]'))
+          [[ ${#roles[@]} -gt 0 ]] || { echo "::error::Could not determine the runner's roles"; exit 1; }
+          for runner_role in "${roles[@]}"; do
+            echo "Found runner roles: ${runner_role}. Checking if runner has 'update' permission on the 'role' resource."
+            allow=($(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443 | jq -r '.[0].spec.allow.rules[] | select(.resources[0]=="role").verbs | index("update")'))
+            deny=($(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443 | jq -r '.[0].spec.deny.rules[]? | select(.resources[0]=="role").verbs | index("update")'))
+            if [[ ${deny} ]]; then
+              echo "Found explicit deny for 'update' the 'role' resource in ${runner_role}."
+              echo "RUNNER_HAS_UPDATE=" >> "$GITHUB_ENV"
+              break
+            fi
+            if [[ ${allow} ]]; then
+              echo "Found 'update' for 'role' resource in ${runner_role}. Will further check for explicit 'deny', if not found – assume runner can update roles."
+              echo "RUNNER_HAS_UPDATE=true" >> "$GITHUB_ENV"
+            fi
+          done
+
+
 #Only required if the user chose to grant `update` on `role`. TODO: add multidoc file test.
       - name: Verify runner roles against supplied configs
         run: | 
@@ -206,7 +228,7 @@ jobs:
             echo "Config is present;"
           } >> "$GITHUB_STEP_SUMMARY"
 
-#Pipeline-generated role for bot doesn't allow 'update' on roles to prevent privilege escalations on own role. 
+#Pipeline-generated role for bot doesn't allow 'update' on roles to prevent privilege escalations on own role. TODO: since we're running create -f, existing resources are treated as updated and fail. Diff'ing the roles with ones in cluster won't help, default stuff gets added. Need to figure a git diff workflow. 
       - name: Apply RBAC file(s)
         if: ${{ !inputs.dry_run }}
         run: |
