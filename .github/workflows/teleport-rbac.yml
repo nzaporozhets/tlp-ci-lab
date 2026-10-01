@@ -195,7 +195,7 @@ jobs:
               has_update="true"
             fi
           done
-          if  [ -z ${has_update} ]; then
+          if  [[ -z ${has_update} ]]; then
             echo "No active roles have 'update' on 'role' set. Runner can not update existing roles."
           fi
           echo "RUNNER_HAS_UPDATE=${has_update}" >> "$GITHUB_ENV"
@@ -219,6 +219,33 @@ jobs:
               fi
             done
           done
+
+      - name: Verify if current changes have new roles or updating existing
+        if: ${{ ! env.RUNNER_HAS_UPDATE }}
+        run: | 
+          set -euo pipefail
+          roles=($(tctl get role -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443 | jq -r '.[].metadata.name'))
+          [[ ${#roles[@]} -gt 0 ]] || { echo "::error::Could not read existing roles from the Teleport cluster. Does the bot role have 'read' on 'role'?"; exit 1; }
+          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
+          apply_files=() 
+          for f in "${files[@]}"; do
+            cfg_type=$(yq '.kind' "$f")
+            change_role=$(yq '.metadata.name' "$f")
+            exists=""
+            for cluster_role in "${roles[@]}"; do
+              if [[ "${change_role}" == "${cluster_role}" && "${cfg_type}" == "role" ]]; then
+                echo "Role ${change_role} (file: ${f}) is already present in the cluster, and runner doesn't have update permissions. Skipping." 
+                exists=1
+                break
+              fi
+            done
+            if [[ -z "${exists}" ]]; then
+              apply_files+=("${f}")
+              echo "File ${f} added to the list of changes"
+            fi
+          done
+          printf '%s\n' "${apply_files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
+          cat "${RUNNER_TEMP}"/cfgs_to_apply.txt
 
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
