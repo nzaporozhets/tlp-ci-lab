@@ -213,7 +213,7 @@ jobs:
           set -eo pipefail
           files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
           for f in "${files[@]}"; do
-            echo "Attempting to create connector $f"
+            echo "Attempting to create resource $f"
             if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
               if grep -qi "access denied" err.log; then
                 action=$(sed -nE 's/.*access denied to perform action "([^"]+)" on "([^"]+)".*/\1/Ip' err.log | head -n1)
@@ -221,7 +221,7 @@ jobs:
                 if [[ ${action} == "update" && ${resource} == role ]]; then
                   echo "::error:: Config file $f appears to make an update on existing role(s). Bot lacks permission to update roles. This is an intentional design choice to prevent permission escalation. If you understand the risks, you can grant the bot's role 'update' on 'roles'."
                 else
-                  echo "::error::Bot lacks permission '${action}' for the resource '${resource}''. Grant the bot's role '${action}' on resource '${resource}'."
+                  echo "::error::Bot lacks permission '${action}' for the resource '${resource}'. Grant the bot's role '${action}' on resource '${resource}'."
                 fi
               fi
               cat err.log
