@@ -195,7 +195,7 @@ jobs:
               has_update="true"
             fi
           done
-          if  [ -z ${RUNNER_HAS_UPDATE} ]; then
+          if  [ -z ${has_update} ]; then
             echo "No active roles have 'update' on 'role' set. Runner can not update existing roles."
           fi
           echo "RUNNER_HAS_UPDATE=${has_update}" >> "$GITHUB_ENV"
