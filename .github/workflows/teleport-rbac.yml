@@ -171,6 +171,23 @@ jobs:
             echo "Identity file: ${TELEPORT_IDENTITY_FILE}"
             exit 1
           fi
+
+      - name: Verify runner roles against supplied configs
+        run: | 
+          set -euo pipefail
+          roles=($(tsh status --proxy="${CLUSTER_NAME}" -f json | jq -r '.active.roles[]'))
+          [[ ${#roles[@]} -gt 0 ]] || { echo "::error::Could not determine the runner's roles"; exit 1; }
+          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
+          for runner_role in "${roles[@]}"; do
+            for f in "${files[@]}"; do
+              cfg_type=($(yq '.kind' "$f"))
+              change_role=($(yq '.metadata.name' "$f"))
+              if [[ "${change_role}" == "${runner_role}" && "${cfg_type}" == "role" ]]; then
+                echo "::error::Attempt to change the runner role ${runner_role} detected. This is not allowed to avoid potential privilege escalation."
+                exit 1
+              fi
+            done
+          done
 #by default, the bot's role doesn't allow 'update' on roles to prevent privilege escalations on own role. Need to test if safe to enable/add modified files check
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
