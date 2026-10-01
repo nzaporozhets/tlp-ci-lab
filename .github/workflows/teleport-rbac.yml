@@ -179,6 +179,7 @@ jobs:
           [[ ${#roles[@]} -gt 0 ]] || { echo "::error::Could not determine the runner's roles"; exit 1; }
           files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
           for runner_role in "${roles[@]}"; do
+            echo "Found runner roles: ${runner_role}. Verifying the RBAC configs."
             for f in "${files[@]}"; do
               cfg_type=($(yq '.kind' "$f"))
               change_role=($(yq '.metadata.name' "$f"))
