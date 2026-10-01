@@ -180,8 +180,9 @@ jobs:
           [[ ${#roles[@]} -gt 0 ]] || { echo "::error::Could not determine the runner's roles"; exit 1; }
           for runner_role in "${roles[@]}"; do
             echo "Found runner roles: ${runner_role}. Checking if runner has 'update' permission on the 'role' resource."
-            allow=($(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443 | jq -r '.[0].spec.allow.rules[] | select(.resources[0]=="role").verbs | index("update")'))
-            deny=($(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443 | jq -r '.[0].spec.deny.rules[]? | select(.resources[0]=="role").verbs | index("update")'))
+            role_json=$(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443) 
+            allow= $(jq -r '.[0].spec.allow.rules[] | select(.resources[0]=="role").verbs | index("update") //empty' <<< ${role_json})
+            deny=$(jq -r '.[0].spec.deny.rules[]? | select(.resources[0]=="role").verbs | index("update") //empty' <<< ${role_json})
             if [[ ${deny} ]]; then
               echo "Found explicit deny for 'update' the 'role' resource in ${runner_role}."
               echo "RUNNER_HAS_UPDATE=" >> "$GITHUB_ENV"
