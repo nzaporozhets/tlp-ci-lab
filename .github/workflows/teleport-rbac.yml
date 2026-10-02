@@ -220,7 +220,7 @@ jobs:
             done
           done
 
-      - name: Verify if current changes have new roles or updating existing
+      - name: Verify if current changes have new roles or updating existing and generate list of new configs only (Runner has no update privileges)
         if: ${{ ! env.RUNNER_HAS_UPDATE }}
         run: | 
           set -euo pipefail
@@ -247,6 +247,13 @@ jobs:
           printf '%s\n' "${apply_files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
           cat "${RUNNER_TEMP}"/cfgs_to_apply.txt
 
+      - name: Generate full list of configs to apply (runner has update privileges)
+        if: ${{ env.RUNNER_HAS_UPDATE }}
+        run: | 
+          set -euo pipefail
+          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
+          printf '%s\n' "${files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
+
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
         run: |
@@ -261,13 +268,12 @@ jobs:
             echo "MWI access confirmed;"
             echo "Config is present;"
           } >> "$GITHUB_STEP_SUMMARY"
-
-#Pipeline-generated role for bot doesn't allow 'update' on roles to prevent privilege escalations on own role. TODO: since we're running create -f, existing resources are treated as updated and fail. Diff'ing the roles with ones in cluster won't help, default stuff gets added. Need to figure a git diff workflow. 
+ 
       - name: Apply RBAC file(s)
         if: ${{ !inputs.dry_run }}
         run: |
           set -eo pipefail
-          files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
+          mapfile -t files < ${RUNNER_TEMP}"/cfgs_to_apply.txt
           for f in "${files[@]}"; do
             echo "Attempting to create resource $f"
             if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
