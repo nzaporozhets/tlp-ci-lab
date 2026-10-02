@@ -220,7 +220,7 @@ jobs:
             done
           done
 
-      - name: Verify if current changes have new roles or updating existing and generate list of new configs only (Runner has no update privileges)
+      - name: Verify if current changes have new roles or updating existing and generate list of new configs only (runner has no update privileges)
         if: ${{ ! env.RUNNER_HAS_UPDATE }}
         run: | 
           set -euo pipefail
@@ -276,7 +276,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           set -eo pipefail
-          mapfile -t files < ${RUNNER_TEMP}"/cfgs_to_apply.txt
+          mapfile -t files < "${RUNNER_TEMP}/cfgs_to_apply.txt"
           for f in "${files[@]}"; do
             echo "Attempting to create resource $f"
             if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
