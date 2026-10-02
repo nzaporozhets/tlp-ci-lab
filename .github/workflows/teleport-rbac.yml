@@ -183,7 +183,7 @@ jobs:
             echo "Found runner roles: ${runner_role}. Checking if runner has 'update' permission on the 'role' resource."
             role_json=$(tctl get role "${runner_role}" -i "${TELEPORT_IDENTITY_FILE}" --format=json --auth-server="${CLUSTER_NAME}":443) 
             allow=$(jq -r '.[0].spec.allow.rules[]? | select(any(.resources[]?; .=="role" or .=="*")) | select(any(.verbs[]?; .=="update" or .=="*")) | .verbs' <<< "${role_json}") 
-            deny=$(jq -r '.[0].spec.allow.rules[]? | select(any(.resources[]?; .=="role" or .=="*")) | select(any(.verbs[]?; .=="update" or .=="*")) | .verbs' <<< "${role_json}")
+            deny=$(jq -r '.[0].spec.deny.rules[]? | select(any(.resources[]?; .=="role" or .=="*")) | select(any(.verbs[]?; .=="update" or .=="*")) | .verbs' <<< "${role_json}")
             if [[ -n ${deny} ]]; then
               echo "Found explicit deny for 'update' the 'role' resource in ${runner_role}."
               has_update=
