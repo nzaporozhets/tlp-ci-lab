@@ -244,9 +244,12 @@ jobs:
               echo "File ${f} added to the list of changes"
             fi
           done
-          printf '%s\n' "${apply_files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
-          echo "Files to be applied:"
-          cat "${RUNNER_TEMP}"/cfgs_to_apply.txt
+          if [[ ! -z "${apply_files[@]}" ]]; then
+            printf '%s\n' "${apply_files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
+            echo "Files to be applied:"
+            cat "${RUNNER_TEMP}"/cfgs_to_apply.txt
+          else echo "::notice::Nothing to apply: all supplied roles already exist and the runner can't update them."; exit 0
+          fi
 
       - name: Generate full list of configs to apply (runner has update privileges)
         if: ${{ env.RUNNER_HAS_UPDATE }}
@@ -276,7 +279,12 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           set -eo pipefail
-          mapfile -t files < "${RUNNER_TEMP}/cfgs_to_apply.txt"
+          cfg_list="${RUNNER_TEMP}/cfgs_to_apply.txt"
+          if [[ ! -s "$list" ]]; then
+              echo "::notice::No RBAC files to apply."
+              exit 0
+          fi          
+          mapfile -t files < "$cfg_list"
           for f in "${files[@]}"; do
             echo "Attempting to create resource $f"
             if ! tctl create -f "$f" -i "${TELEPORT_IDENTITY_FILE}" --auth-server="${CLUSTER_NAME}":443 2>err.log; then
