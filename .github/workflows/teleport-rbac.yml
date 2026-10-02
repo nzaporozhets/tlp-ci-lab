@@ -245,6 +245,7 @@ jobs:
             fi
           done
           printf '%s\n' "${apply_files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
+          echo "Files to be applied:"
           cat "${RUNNER_TEMP}"/cfgs_to_apply.txt
 
       - name: Generate full list of configs to apply (runner has update privileges)
@@ -253,6 +254,8 @@ jobs:
           set -euo pipefail
           files=("${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/teleport/rbac/"*.yaml)
           printf '%s\n' "${files[@]}" > "${RUNNER_TEMP}/cfgs_to_apply.txt"
+          echo "Files to be applied:"
+          cat "${RUNNER_TEMP}"/cfgs_to_apply.txt
 
       - name: Stop dryrun
         if: ${{ inputs.dry_run }}
