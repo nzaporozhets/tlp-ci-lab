@@ -280,7 +280,7 @@ jobs:
         run: |
           set -eo pipefail
           cfg_list="${RUNNER_TEMP}/cfgs_to_apply.txt"
-          if [[ ! -s "$list" ]]; then
+          if [[ ! -s "$cfg_list" ]]; then
               echo "::notice::No RBAC files to apply."
               exit 0
           fi          
