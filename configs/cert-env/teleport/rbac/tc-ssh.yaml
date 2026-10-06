@@ -5,15 +5,17 @@ metadata:
 spec:
   allow:
     logins:
-    - ubuntu
-    - ec2-user
+    - teleport-noroot
     node_labels:
       '*': '*'
   deny:
-    logins:
-    - root
+    host_sudoers:
+    - '*'
+    - 'ALL=(ALL) NOPASSWD: ALL'  
   options:
     cert_format: standard
+    create_host_user_default_shell: /bin/bash
+    create_host_user_mode: insecure-drop
     create_db_user: false
     create_desktop_user: false
     desktop_clipboard: true

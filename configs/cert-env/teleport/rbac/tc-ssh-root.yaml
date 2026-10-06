@@ -6,13 +6,14 @@ spec:
   allow:
     logins:
     - ubuntu
-    - ec2-user
     - root
     node_labels:
       '*': '*'
   deny: {}
   options:
     cert_format: standard
+    create_host_user_default_shell: /bin/bash
+    create_host_user_mode: insecure-drop
     create_db_user: false
     create_desktop_user: false
     desktop_clipboard: true
