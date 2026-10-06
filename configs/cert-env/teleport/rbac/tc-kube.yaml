@@ -6,7 +6,7 @@ metadata:
 spec:
   allow:
     kubernetes_groups:
-    - viewers
+    - tc-ns-edit
     kubernetes_labels:
       '*': '*'
     kubernetes_resources:
