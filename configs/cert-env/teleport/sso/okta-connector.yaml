@@ -11,7 +11,7 @@ spec:
     value: admins
   - name: groups
     roles:
-    - access
+    - tc-requester
     value: members
   audience: https://certlab.zap.tams.sh/v1/webapi/saml/acs/okta
   cert: ""
