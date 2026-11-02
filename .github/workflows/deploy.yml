@@ -70,7 +70,7 @@ jobs:
 
       - name: Install Teleport client tools
         if: runner.environment != 'self-hosted'
-        uses: gravitational/teleport-actions/setup@v2
+        uses: teleport-actions/setup@v2
         with:
           version: ${{ env.PARENT_TELEPORT_VERSION }}
 
