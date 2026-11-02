@@ -39,11 +39,11 @@ jobs:
 
       - name: Check out this repository onto the runner
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      
+
       - name: Export required variables
         run: cat "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/gh_vars.env" >> "$GITHUB_ENV"
   
-        - name: Check that environment for deployment is configured
+      - name: Check that environment for deployment is configured
         run: |
           set -euo pipefail
           if [ -z "${DEPLOY_ENV}" ]; then
