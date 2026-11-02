@@ -48,7 +48,7 @@ jobs:
         if: runner.environment != 'self-hosted'
         run: |
           set -euo pipefail
-          if [ -z "${PARENT_TELEPORT_VERSION }" ]; then
+          if [ -z "${PARENT_TELEPORT_VERSION}" ]; then
             echo "The repository var to configure the parent Teleport cluster' version is missing. (set "PARENT_TELEPORT_VERSION" in the configs/[env name]/gh_vars.yaml)"
             exit 1;
           fi
