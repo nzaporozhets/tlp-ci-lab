@@ -50,6 +50,12 @@ jobs:
       - name: Export required variables
         run: cat "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/gh_vars.env" >> "$GITHUB_ENV"
 
+      - name: Install Teleport client tools
+        if: runner.environment != 'self-hosted'
+        uses: teleport-actions/setup@v2
+        with:
+          version: ${{ env.TELEPORT_VERSION }}
+
       - name: Check the required command-line tools are installed
         run: |
           set -euo pipefail
@@ -74,12 +80,6 @@ jobs:
           helm version
           echo "jq      $(jq --version)"
           openssl version
-
-      - name: Install Teleport client tools
-        if: runner.environment != 'self-hosted'
-        uses: teleport-actions/setup@v2
-        with:
-          version: ${{ env.TELEPORT_VERSION }}
 
       - name: Read Teleport cluster name from Helm values
         run: |
