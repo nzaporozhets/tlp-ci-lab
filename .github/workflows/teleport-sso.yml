@@ -21,6 +21,7 @@ permissions:
   contents: read
   id-token: write
 jobs:
+  detect:
     runs-on: ubuntu-latest
     outputs:
       envs: ${{ steps.d.outputs.envs }}
@@ -42,6 +43,7 @@ jobs:
             done
           fi
           echo "envs=$(jq -nc '$ARGS.positional' --args "${envs_b[@]}")" >> "$GITHUB_OUTPUT"
+
   configure_sso:
     needs: detect
     if: needs.detect.outputs.envs != '[]'
