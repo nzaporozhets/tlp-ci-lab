@@ -10,11 +10,6 @@ on:
         description: 'Name of the environment to configure. Should match the directory name in configs/'
         required: true
         type: string
-      mwi_configured:
-      #TODO no cross-workflow dependencies in GHA, currently an "honor" system. Can be refactored to API workflow status check.
-        description: "I confirm that cluster deploy job was set to configure MWI and ran successfully OR I have supplied my own MWI config as configs/[env name]/mwi/tbot.yaml"
-        type: boolean
-        required: true
   push:
     branches: [main]
     paths:
@@ -65,10 +60,6 @@ jobs:
       MWI_SUPPLIED: ""
       RUNNER_HAS_UPDATE: ""
     steps:
-      - name: Require MWI confirmation
-        if: ${{ !inputs.mwi_configured }}
-        run: echo "::error::Confirm MWI is configured – can't connect to your Teleport cluster without identity souce"; exit 1
-
       - name: Check out this repository onto the runner
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -151,6 +142,7 @@ jobs:
             echo "::error::No yaml files have been found under configs/${DEPLOY_ENV}/teleport/rbac/. Please upload your Role or Access List yaml files."
             exit 1
           fi
+
       - name: Check for supplied MWI config
         run: |
           set -euo pipefail 
@@ -198,7 +190,10 @@ jobs:
         if: ${{ !env.MWI_SUPPLIED }}
         run: |
           set -euo pipefail
-          tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
+          if ! tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"; then
+             echo "::error::Tbot start failed. Verify that you've supplied an MWI identity or configured the cluster deployment pipeline to create a default tbot."
+             exit 1;
+          fi
           echo "TELEPORT_KEY_AGENT_DIR=${RUNNER_TEMP}/machine-id/" >> "$GITHUB_ENV"
           echo "TELEPORT_IDENTITY_FILE=${RUNNER_TEMP}/machine-id/identity" >> "$GITHUB_ENV"
 
