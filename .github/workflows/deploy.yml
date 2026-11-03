@@ -22,7 +22,7 @@ permissions:
   id-token: write
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, teleport] # need to check tbot/k8s access path before switching to gh runner
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
       run:
@@ -44,6 +44,15 @@ jobs:
             exit 1;
           fi
 
+      - name: Check that parent Teleport version is configured (GH runners only)
+        if: runner.environment != 'self-hosted'
+        run: |
+          set -euo pipefail
+          if [ -z "${PARENT_TELEPORT_VERSION}" ]; then
+            echo "The repository var to configure the parent Teleport cluster' version is missing. (set "PARENT_TELEPORT_VERSION" in the configs/[env name]/gh_vars.yaml)"
+            exit 1;
+          fi
+
       - name: Check the required env variables are set
         run: |
           set -euo pipefail
@@ -59,13 +68,19 @@ jobs:
             exit 1
           fi
 
+      - name: Install Teleport client tools
+        if: runner.environment != 'self-hosted'
+        uses: teleport-actions/setup@v2
+        with:
+          version: ${{ env.PARENT_TELEPORT_VERSION }}
+
       - name: Verify Helm config for the region is present
         run: |
           set -euo pipefail
           if [ ! -f "${GITHUB_WORKSPACE}/configs/${DEPLOY_ENV}/helm/teleport-cluster-values.yaml" ]; then
             echo "Helm config for the region seems to be missing. Please create the teleport-cluster-values.yaml file in /[env name]/helm/ "
             exit 1
-          fi          
+          fi
 
       - name: Check the required command-line tools are installed
         run: |
