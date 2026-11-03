@@ -15,6 +15,10 @@ on:
         description: "I confirm that cluster deploy job was set to configure MWI and ran successfully OR I have supplied my own MWI config as configs/[env name]/mwi/tbot.yaml"
         type: boolean
         required: true
+  push:
+    branches: [main]
+    paths:
+      - 'configs/*/teleport/rbac'
 concurrency:
   group: teleport-configs
   cancel-in-progress: false
@@ -22,14 +26,42 @@ permissions:
   contents: read
   id-token: write
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.d.outputs.envs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: 
+          fetch-depth: 0
+      - id: d
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+        run: |
+          envs_b=()
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            envs_b=("$DEPLOY_ENV")
+          else
+            for env in $(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" -- "configs/*/teleport/rbac/" | cut -d/ -f2 | sort -u); do
+             [ -d "configs/$env" ] && envs_b+=("$env")
+            done
+          fi
+          echo "envs=$(jq -nc '$ARGS.positional' --args "${envs_b[@]}")" >> "$GITHUB_OUTPUT"
+    
   configure_rbac:
+    needs: detect
+    if: needs.detect.outputs.envs != '[]'
+    strategy:
+      matrix:
+        env: ${{ fromJson(needs.detect.outputs.envs) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
       run:
         shell: bash
     env:
-      DEPLOY_ENV: ${{ inputs.deploy_env }}    
+      DEPLOY_ENV: ${{ matrix.env }}    
       MWI_SUPPLIED: ""
       RUNNER_HAS_UPDATE: ""
     steps:
