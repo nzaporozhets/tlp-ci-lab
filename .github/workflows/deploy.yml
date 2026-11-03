@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${DEPLOY_ENV}" ]; then
-            echo "The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV" in the configs/[env name]/gh_vars.yaml if running on push.)"
+            echo "The repository var to select the environment to deploy is missing."
             exit 1;
           fi
 
