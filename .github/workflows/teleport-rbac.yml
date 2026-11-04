@@ -43,6 +43,7 @@ jobs:
             done
           fi
           echo "envs=$(jq -nc '$ARGS.positional' --args "${envs_b[@]}")" >> "$GITHUB_OUTPUT"
+          echo "Environments to deploy: $envs"
     
   configure_rbac:
     needs: detect
