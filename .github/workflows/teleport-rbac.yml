@@ -13,7 +13,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'configs/*/teleport/rbac'
+      - 'configs/*/teleport/rbac/**'
 concurrency:
   group: teleport-configs
   cancel-in-progress: false
@@ -38,7 +38,7 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             envs_b=("$DEPLOY_ENV")
           else
-            for env in $(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" -- "configs/*/teleport/rbac/" | cut -d/ -f2 | sort -u); do
+            for env in $(git diff --name-only --diff-filter=d "$BEFORE_SHA" "$GITHUB_SHA" -- ':(glob)configs/*/teleport/rbac/**' | cut -d/ -f2 | sort -u); do
              [ -d "configs/$env" ] && envs_b+=("$env")
             done
           fi
