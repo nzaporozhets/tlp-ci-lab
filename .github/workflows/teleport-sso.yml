@@ -10,11 +10,10 @@ on:
         description: 'Name of the environment to configure. Should match the directory name in configs/'
         required: true
         type: string
-      mwi_configured:
-      #TODO no cross-workflow dependencies in GHA, currently an "honor" system. Can be refactored to API workflow status check.
-        description: "I confirm that cluster deploy job was set to configure MWI and ran successfully OR I have supplied my own MWI config as configs/[env name]/mwi/tbot.yaml"
-        type: boolean
-        required: true
+  push:
+    branches: [main]
+    paths:
+      - 'configs/*/teleport/sso/**'
 concurrency:
   group: teleport-configs
   cancel-in-progress: false
@@ -22,20 +21,44 @@ permissions:
   contents: read
   id-token: write
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.d.outputs.envs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: 
+          fetch-depth: 0
+      - id: d
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+        run: |
+          envs_b=()
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            envs_b=("$DEPLOY_ENV")
+          else
+            for env in $(git diff --name-only --diff-filter=d "$BEFORE_SHA" "$GITHUB_SHA" -- ':(glob)configs/*/teleport/sso/' | cut -d/ -f2 | sort -u); do
+             [ -d "configs/$env" ] && envs_b+=("$env")
+            done
+          fi
+          echo "envs=$(jq -nc '$ARGS.positional' --args "${envs_b[@]}")" >> "$GITHUB_OUTPUT"
+
   configure_sso:
+    needs: detect
+    if: needs.detect.outputs.envs != '[]'
+    strategy:
+      matrix:
+        env: ${{ fromJson(needs.detect.outputs.envs) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
       run:
         shell: bash
     env:
-      DEPLOY_ENV: ${{ inputs.deploy_env }}    
+      DEPLOY_ENV: ${{ matrix.env }}    
       MWI_SUPPLIED: ""
     steps:
-      - name: Require MWI confirmation
-        if: ${{ !inputs.mwi_configured }}
-        run: echo "::error::Confirm MWI is configured – can't connect to your Teleport cluster without identity souce"; exit 1
-
       - name: Check out this repository onto the runner
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -43,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${DEPLOY_ENV}" ]; then
-            echo "::error::The repository var to select the environment to deploy is missing. (set "DEPLOY_ENV" in the configs/[env name]/gh_vars.yaml if running on push.)"
+            echo "::error::The repository var to select the environment to deploy is missing."
             exit 1;
           fi
       
@@ -164,7 +187,10 @@ jobs:
         if: ${{ !env.MWI_SUPPLIED }}
         run: |
           set -euo pipefail
-          tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"
+          if ! tbot start --oneshot -c "${RUNNER_TEMP}/tbot.yaml"; then
+             echo "::error::Tbot start failed. Verify that you've supplied an MWI identity or configured the cluster deployment pipeline to create a default tbot."
+             exit 1;
+          fi
           echo "TELEPORT_KEY_AGENT_DIR=${RUNNER_TEMP}/machine-id/" >> "$GITHUB_ENV"
           echo "TELEPORT_IDENTITY_FILE=${RUNNER_TEMP}/machine-id/identity" >> "$GITHUB_ENV"
 
