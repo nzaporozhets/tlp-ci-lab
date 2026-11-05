@@ -22,7 +22,7 @@ permissions:
   id-token: write
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, teleport]
     timeout-minutes: 20
     defaults:
       run:
