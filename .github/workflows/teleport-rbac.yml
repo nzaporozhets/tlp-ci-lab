@@ -85,7 +85,7 @@ jobs:
           done
 
           if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "::error::These env variables are empty or not set: ${missing[*]}. Add to the configs/${DEPLOY_ENV}/gh_vars.yaml"
+            echo "::error::These env variables are empty or not set: ${missing[*]}. Add to the configs/${DEPLOY_ENV}/gh_vars.env"
             exit 1
           fi
 
@@ -113,10 +113,6 @@ jobs:
             exit 1
           fi
 
-          # Print versions: when something behaves oddly later, the first
-          # question is always "which version?", and the answer is now in the log.
-          kubectl version --client
-          helm version
           echo "jq      $(jq --version)"
           openssl version
 
@@ -334,18 +330,3 @@ jobs:
               exit 1
             fi
           done
-
-
-      - name: some next step
-        if: ${{ !inputs.dry_run }}
-        run: | 
-          set -euo pipefail
-
-      - name: some next step
-        if: ${{ !inputs.dry_run }}
-        run: | 
-          set -euo pipefail
-
-
-      
-

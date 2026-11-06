@@ -64,7 +64,7 @@ jobs:
           done
 
           if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "These env variables are empty or not set: ${missing[*]}. Add to the configs/${DEPLOY_ENV}/gh_vars.yaml"
+            echo "These env variables are empty or not set: ${missing[*]}. Add to the configs/${DEPLOY_ENV}/gh_vars.env"
             exit 1
           fi
 
@@ -165,8 +165,7 @@ jobs:
             echo "Required software is present;"
             echo "tbot ran successfully;"
             echo "K8s access confirmed, required ns and secrets present;"
-            echo "Config is present;"
-            echo "Helm lint successful."
+            echo "Config is present."
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Everything below should check for dry run
@@ -231,11 +230,9 @@ jobs:
             github:
               allow:
               - repository: "${{ github.repository }}"
-              - workflow:
-                - Configure SSO connector(s) for the Teleport cluster
+              - workflow: "Configure SSO connector(s) for the Teleport cluster"
               - repository: "${{ github.repository }}"
-              - workflow:
-                - Configure Teleport RBAC
+              - workflow: "Configure Teleport RBAC"
           EOF
 
           echo "Creating a bot user..."
