@@ -22,7 +22,7 @@ permissions:
   id-token: write
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, teleport]
+    runs-on: [self-hosted, linux, teleport-deploy]
     timeout-minutes: 20
     defaults:
       run:

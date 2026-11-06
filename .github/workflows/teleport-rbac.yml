@@ -22,7 +22,7 @@ permissions:
   id-token: write
 jobs:
   detect:
-    runs-on: [self-hosted, linux, teleport]
+    runs-on: [self-hosted, linux, teleport-deploy]
     outputs:
       envs: ${{ steps.d.outputs.envs }}
     steps:
@@ -50,7 +50,7 @@ jobs:
     strategy:
       matrix:
         env: ${{ fromJson(needs.detect.outputs.envs) }}
-    runs-on: [self-hosted, linux, teleport]
+    runs-on: [self-hosted, linux, teleport-deploy]
     timeout-minutes: 20
     defaults:
       run:
