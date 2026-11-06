@@ -36,7 +36,7 @@ Create a folder under `configs` with the following:
 	The file shouldn't have inline comments or quotes, because it's ingested into `$GITHUB_ENV`;
 - `/helm/teleport-cluster-values.yaml` – Helm values file. [Chart reference.](https://goteleport.com/docs/reference/helm-reference/teleport-cluster/) 
 - Create a tbot.yaml file in the repo root with a tbot config. `tbot` [config reference](https://goteleport.com/docs/reference/machine-workload-identity/configuration/). This config should target your governing Teleport cluster. Config for the clusters you deploy with the pipeline can be provided through `tbot.yaml` in `configs/[env name]/teleport/mwi` folder(s). Example is provided in the [`templates`](templates/) folder. 
-- For your tbot config, it's recommended to limit your token based on [available `allow` rules](https://goteleport.com/docs/reference/deployment/join-methods/#github-actions-github), default is limited to repository only. This would allow other workflows and any branches to use MWI;
+- For your tbot config, it's recommended to limit your token based on [available `allow` rules](https://goteleport.com/docs/reference/deployment/join-methods/#github-actions-github), default is limited to repository and this repository's workflows. This would still allow any branches to use MWI;
 - RBAC and SSO pipelines are configured to run on push into respective directories or to be started manually for a specified env.
 
 By default the pipeline is configured to run on a self-hosted runner for environments that don't have open inbound 443 on Teleport proxies. If you wish to change that, change workflow files `runs-on` property to `ubuntu-latest` (tested and confirmed working, other images might need dependencies installation steps).
