@@ -231,6 +231,11 @@ jobs:
             github:
               allow:
               - repository: "${{ github.repository }}"
+              - workflow:
+                - Configure SSO connector(s) for the Teleport cluster
+              - repository: "${{ github.repository }}"
+              - workflow:
+                - Configure Teleport RBAC
           EOF
 
           echo "Creating a bot user..."
