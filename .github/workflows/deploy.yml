@@ -44,8 +44,7 @@ jobs:
             exit 1;
           fi
 
-      - name: Check that parent Teleport version is configured (GH runners only)
-        if: runner.environment != 'self-hosted'
+      - name: Check that parent Teleport version is configured 
         run: |
           set -euo pipefail
           if [ -z "${PARENT_TELEPORT_VERSION}" ]; then
@@ -69,7 +68,6 @@ jobs:
           fi
 
       - name: Install Teleport client tools
-        if: runner.environment != 'self-hosted'
         uses: teleport-actions/setup@v2
         with:
           version: ${{ env.PARENT_TELEPORT_VERSION }}

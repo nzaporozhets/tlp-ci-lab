@@ -90,7 +90,6 @@ jobs:
           fi
 
       - name: Install Teleport client tools
-        if: runner.environment != 'self-hosted'
         uses: teleport-actions/setup@v2
         with:
           version: ${{ env.TELEPORT_VERSION }}
