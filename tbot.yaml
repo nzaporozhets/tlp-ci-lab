@@ -1,5 +1,5 @@
 version: v2
-proxy_server: test02.zap.tams.sh:443
+proxy_server: nzaporozhets.cloud.gravitational.io:443
 onboarding:
   join_method: github
   token: github-bot
@@ -9,10 +9,9 @@ storage:
 services:
   - type: kubernetes/v2
     selectors:
-      - name: nikita-eks-certlab
+      - name: certlab
       - labels:
           env: certlab
     destination:
       type: directory
-
       path: "${RUNNER_TEMP}/machine-id"
