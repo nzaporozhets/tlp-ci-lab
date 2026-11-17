@@ -116,7 +116,7 @@ jobs:
       - name: Verify access to k8s cluster and resources
         run: |
           set -euo pipefail
-          if ! kubectl cluster-info; then
+          if ! kubectl auth whoami; then
             echo "Connecting to k8s failed, verify tbot"
             exit 1
           fi
